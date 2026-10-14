@@ -1,0 +1,29 @@
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+email-validator==2.2.0
+python-multipart==0.0.20
+
+# Database
+SQLAlchemy==2.0.36
+# SQLAlchemy's async mode needs greenlet. On Python 3.13 pip does not always
+# pull it in automatically, which crashes the app on startup with
+# "the greenlet library is required". Pinning it explicitly avoids that.
+greenlet>=3.1.1
+aiosqlite==0.20.0
+# Uncomment if you switch DATABASE_URL to Postgres:
+# asyncpg==0.30.0
+alembic==1.14.0
+
+# HTTP + config
+httpx==0.28.1
+python-dotenv==1.0.1
+
+# Optional: only needed if you set REDIS_URL in .env
+redis==5.2.1
+
+# Tests
+pytest==8.3.4
+pytest-asyncio==0.25.0

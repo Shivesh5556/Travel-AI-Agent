@@ -1,0 +1,41 @@
+# Render Blueprint - one FREE web service that serves the API and the website.
+# Render dashboard -> New -> Blueprint -> pick this repo. It reads this file.
+services:
+  - type: web
+    name: ghumi-ghumi
+    runtime: python
+    plan: free
+    region: singapore          # closest Render region to India
+    branch: main
+    buildCommand: >-
+      pip install -r backend/requirements.txt &&
+      cd frontend && npm ci --include=dev && npm run build
+    startCommand: >-
+      cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
+      --proxy-headers --forwarded-allow-ips="*"
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: STRICT_MODE
+        value: "true"
+      # --- you paste these three in the dashboard (never in Git) ---
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DUFFEL_API_KEY
+        sync: false
+      - key: GEOAPIFY_API_KEY
+        sync: false
+      - key: NOMINATIM_CONTACT
+        sync: false
+      # --- safety for a public site ---
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: MAX_TRIPS_PER_HOUR
+        value: "10"
+      - key: TRIP_TTL_HOURS
+        value: "6"
+      # Free instances have no persistent disk. That is fine here: trips are
+      # view-once, so SQLite on the temporary disk is all we need.
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:///./ghumi.db

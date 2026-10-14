@@ -1,0 +1,49 @@
+# Run the whole project with one command:
+#     docker compose up --build
+#
+# Put your API keys in backend/.env first.
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      # Inside Docker the frontend is reached by container name, so the
+      # allowed origins list needs both.
+      CORS_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173"
+    volumes:
+      - ./backend:/app
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+# Want Postgres and Redis instead of SQLite and an in-memory cache?
+# Uncomment below, then set these in backend/.env:
+#   DATABASE_URL=postgresql+asyncpg://ghumi:ghumi@db:5432/ghumi
+#   REDIS_URL=redis://cache:6379
+#
+#  db:
+#    image: postgres:16-alpine
+#    environment:
+#      POSTGRES_USER: ghumi
+#      POSTGRES_PASSWORD: ghumi
+#      POSTGRES_DB: ghumi
+#    ports:
+#      - "5432:5432"
+#
+#  cache:
+#    image: redis:7-alpine
+#    ports:
+#      - "6379:6379"

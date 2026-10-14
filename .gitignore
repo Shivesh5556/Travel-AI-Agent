@@ -1,0 +1,25 @@
+# secrets - NEVER commit these
+.env
+backend/.env
+*.env.local
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# databases (SQLite files are created at runtime)
+*.db
+*.sqlite3
+
+# node / build output
+node_modules/
+frontend/dist/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
