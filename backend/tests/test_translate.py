@@ -61,4 +61,8 @@ def test_endpoint_rejects_unknown_language(monkeypatch):
     from fastapi.testclient import TestClient
     import main
     with TestClient(main.app) as client:
-        assert client.post("/api/translate", json={"lang": "xx", "texts": ["a"]}).status_code == 400
+        body = {"lang": "xx", "texts": ["a"]}
+        # Since v30 every write needs a browser session first (HttpOnly cookie).
+        assert client.post("/api/translate", json=body).status_code == 401
+        assert client.post("/api/session").status_code == 200   # TestClient keeps the cookie
+        assert client.post("/api/translate", json=body).status_code == 400
