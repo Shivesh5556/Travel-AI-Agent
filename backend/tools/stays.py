@@ -24,7 +24,7 @@ import re
 
 import config
 import recommend
-from tools import webclient
+from tools import city_prices, webclient
 from tools.geo import haversine_km
 
 # How much a night roughly costs by property type, in rupees.
@@ -36,13 +36,10 @@ BASE_PRICE = {
     "resort": 6000,
 }
 
-# Some cities are simply pricier. Multiplier on the base price.
-CITY_MULTIPLIER = {
-    "mumbai": 1.8, "delhi": 1.5, "new delhi": 1.5, "bengaluru": 1.5, "bangalore": 1.5,
-    "goa": 1.6, "panaji": 1.6, "leh": 1.4, "udaipur": 1.4, "gangtok": 1.1,
-    "jaipur": 1.2, "manali": 1.2, "shimla": 1.2, "munnar": 1.2, "andaman": 1.7,
-    "varanasi": 0.9, "agra": 1.0, "hampi": 0.8, "pushkar": 0.8, "rishikesh": 0.9,
-}
+# Some cities are simply pricier. The index now lives in tools/city_prices.py so
+# hotel prices and daily costs (tools/budget.py) use the same numbers. Kept
+# under the old name for anything that imported it.
+CITY_MULTIPLIER = city_prices.HOTEL_INDEX
 
 # Each star ABOVE what is normal for that property type adds this much.
 STAR_BONUS = 900
@@ -70,7 +67,7 @@ def estimate_price(kind: str, stars: int, city: str) -> int:
     extra_stars = max(0, stars - BASELINE_STARS.get(kind, 3))
     base += extra_stars * STAR_BONUS
 
-    base *= CITY_MULTIPLIER.get(city.strip().lower(), 1.0)
+    base *= city_prices.hotel_multiplier(city)
     return int(round(base / 50) * 50)   # round to the nearest 50 rupees
 
 
@@ -267,7 +264,7 @@ def _enrich_with_ratings(stays: list[dict], rated: list[dict], city: str) -> Non
                 stay["ratings_count"] = r.get("ratings_count")
             tier = r.get("price_tier")
             if tier in FSQ_PRICE_BAND and not stay.get("is_price_band"):
-                band = FSQ_PRICE_BAND[tier] * CITY_MULTIPLIER.get(city.strip().lower(), 1.0)
+                band = FSQ_PRICE_BAND[tier] * city_prices.hotel_multiplier(city)
                 new_price = int(round((stay["price_per_night_inr"] + band) / 2 / 50) * 50)
                 nights = stay["total_inr"] // max(1, stay["price_per_night_inr"])
                 stay["price_per_night_inr"] = new_price

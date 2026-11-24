@@ -42,7 +42,7 @@ from agent.registry import TOOL_SCHEMAS, run_tool, short_summary
 from dayplanner import build_day_plan, total_distance
 from rag.retriever import retriever
 from schemas import TripRequest
-from tools import geo, places, stays, transport, weather
+from tools import city_prices, geo, places, stays, transport, weather
 from tools.geo import haversine_km
 
 SYSTEM_PROMPT = """You are the planning agent for Ghumi Ghumi, a travel planner
@@ -181,6 +181,7 @@ async def _plan_trip(trip_id: str, req: TripRequest) -> dict:
         transport_options=transport_options,
         stay_options=context.get("stay_options", []),
         travel_style=req.travel_style,
+        city=req.destination_city,
     )
 
     # Replay each round of the solver as its own event, so the UI shows the
@@ -253,7 +254,7 @@ async def _plan_trip(trip_id: str, req: TripRequest) -> dict:
     # How much of each day is really free: the arrival day starts after the
     # journey, the last day ends in time to go home.
     windows = dayplanner.day_windows(req.num_days, decision["transport"])
-    if req.destination_city.strip().lower() in critic.HIGH_ALTITUDE and req.num_days >= 3:
+    if city_prices.normalise_city(req.destination_city) in critic.HIGH_ALTITUDE and req.num_days >= 3:
         windows[0].update(available_hours=0.0, travel_note=(
             (windows[0]["travel_note"] + " ").lstrip() +
             "Day 1 is kept free to acclimatise to the altitude - rest, drink water, no exertion."))
@@ -294,7 +295,8 @@ async def _plan_trip(trip_id: str, req: TripRequest) -> dict:
         context.get("stay_options", []), stay,
         budget_inr=req.budget_inr, transport_total=decision["transport"]["total_inr"] * 2,
         days=req.num_days, nights=req.num_nights, travelers=req.travelers,
-        style=decision["budget"]["style"], travel_style=req.travel_style, anchor=stay_anchor)
+        style=decision["budget"]["style"], travel_style=req.travel_style, anchor=stay_anchor,
+        city=req.destination_city)
     if stay:
         scored_pick = next((s for s in stay_view["picks"] if s["name"] == stay["name"]), None)
         if scored_pick is None:
@@ -503,6 +505,8 @@ def _lock_args(name: str, args: dict, req: TripRequest) -> dict:
     if name == "get_weather":
         args["start_date"] = req.start_date.isoformat()
         args["end_date"] = req.end_date.isoformat()
+    if name == "calculate_budget":
+        args["city"] = req.destination_city     # daily costs must match the destination
     if name == "search_transport":
         args["origin_city"] = req.source_city
         args["destination_city"] = req.destination_city

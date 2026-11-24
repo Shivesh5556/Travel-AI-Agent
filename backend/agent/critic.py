@@ -23,6 +23,7 @@ import math
 import dayplanner
 import llm
 import recommend
+from tools import city_prices
 from tools.geo import haversine_km
 
 # Places where altitude is a genuine health issue, not a nice view.
@@ -242,7 +243,7 @@ def rule_checks(plan: dict, trip_text: str, destination: str) -> list[dict]:
         })
 
     # --- altitude ---
-    if destination.strip().lower() in HIGH_ALTITUDE and len(days) < 4:
+    if city_prices.normalise_city(destination) in HIGH_ALTITUDE and len(days) < 4:
         issues.append({
             "severity": "warning",
             "kind": "altitude", "for_traveller": True,

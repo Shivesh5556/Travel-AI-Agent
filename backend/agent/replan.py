@@ -117,22 +117,29 @@ def _preferred_transport(options: list[dict], travel_style: str) -> dict | None:
 def solve(days: int, nights: int, travelers: int, budget_inr: int,
           transport_options: list[dict], stay_options: list[dict],
           round_trip: bool = True, travel_style: str = "balanced",
-          anchor: tuple[float, float] | None = None) -> dict:
+          anchor: tuple[float, float] | None = None,
+          city: str | None = None) -> dict:
     """Evaluate every supplied combination before declaring a trip unaffordable.
+
+    `city` makes food, local transport and activities cost what they cost in
+    that destination (tools/budget.daily_rates). It is passed to EVERY money
+    function below - the floor, the hotel ceiling and the totals - so they all
+    use the same rates. Leave it out for national averages.
 
     The search is finite (rides x stays x three spending levels). Displayed
     attempts describe the initial choice and the selected result, rather than
     limiting the actual feasibility search to an arbitrary number of rounds.
     """
-    floor = budget_tool.cheapest_possible(days, travelers)
+    floor = budget_tool.cheapest_possible(days, travelers, city)
+    full_buffer = budget_tool.full_buffer_percent(city)
     empty = {"fits": False, "impossible": True, "travel_style": travel_style,
              "transport": None, "stay": None, "budget": None, "attempts": [],
              "rounds": 0, "upgrade_rounds": 0, "minimum_needed_inr": floor}
     if budget_inr < floor:
         return {**empty, "reason": (
             f"Even at the most basic level, {days} days for {travelers} "
-            f"traveller(s) costs about Rs {floor:,} in food and local "
-            "transport alone, before you get there or sleep anywhere.")}
+            f"traveller(s) costs about Rs {floor:,} in food, local transport "
+            "and entry tickets alone, before you get there or sleep anywhere.")}
     if not transport_options:
         return {**empty, "reason": "No way to get to this destination was found."}
     if nights > 0 and not stay_options:
@@ -147,7 +154,7 @@ def solve(days: int, nights: int, travelers: int, budget_inr: int,
             travel_total_inr=ride["total_inr"] * factor,
             stay_total_inr=recommend.group_price(stay) * nights if stay else 0,
             days=days, travelers=travelers, budget_inr=budget_inr,
-            style=style, buffer_percent=buffer_percent)
+            style=style, buffer_percent=buffer_percent, city=city)
 
     def attempt(ride, stay, result, number, **extra):
         return {"round": number, "transport": f"{ride['carrier']} ({ride['mode']})",
@@ -159,7 +166,8 @@ def solve(days: int, nights: int, travelers: int, budget_inr: int,
                 "change_made": None, **extra}
 
     ceiling = budget_tool.stay_ceiling(
-        budget_inr, initial_ride["total_inr"] * factor, days, travelers, initial_style, nights)
+        budget_inr, initial_ride["total_inr"] * factor, days, travelers, initial_style, nights,
+        city)
     initial_stay = _pick_stay(stay_options, ceiling, travel_style, anchor)
     initial_result = evaluate(initial_ride, initial_stay, initial_style)
     attempts = [attempt(initial_ride, initial_stay, initial_result, 1)]
@@ -182,7 +190,7 @@ def solve(days: int, nights: int, travelers: int, budget_inr: int,
     for ride in sorted(transport_options, key=ride_key):
         for style_rank, style in enumerate(styles):
             ceiling = budget_tool.stay_ceiling(
-                budget_inr, ride["total_inr"] * factor, days, travelers, style, nights)
+                budget_inr, ride["total_inr"] * factor, days, travelers, style, nights, city)
             ranked = recommend.rank_stays(stay_options, ceiling, travel_style, anchor)
             for stay in ranked or [None]:
                 result = evaluate(ride, stay, style)
@@ -191,7 +199,8 @@ def solve(days: int, nights: int, travelers: int, budget_inr: int,
                 if minimum is None or lowest["total_inr"] < minimum[2]["total_inr"]:
                     minimum = item
                 if not result["fits"]:
-                    trimmed = budget_tool.buffer_that_fits(result["subtotal_inr"], budget_inr)
+                    trimmed = budget_tool.buffer_that_fits(
+                        result["subtotal_inr"], budget_inr, full_buffer)
                     if trimmed is not None:
                         result = evaluate(ride, stay, style, trimmed)
                 if result["fits"]:
@@ -199,7 +208,7 @@ def solve(days: int, nights: int, travelers: int, budget_inr: int,
                     # upgrade; score stays against the same spending context.
                     quality = stay.get("score", 0) if stay else 0
                     key = (ride_key(ride), style_rank,
-                           result["buffer_percent"] < budget_tool.BUFFER_PERCENT,
+                           result["buffer_percent"] < full_buffer,
                            -quality, result["total_inr"])
                     candidates.append((key, ride, stay, result))
 
@@ -213,9 +222,9 @@ def solve(days: int, nights: int, travelers: int, budget_inr: int,
                         (recommend.group_price(stay) if stay else 0) ==
                         (recommend.group_price(initial_stay) if initial_stay else 0) and
                         result["style"] == initial_style and
-                        result["buffer_percent"] < budget_tool.BUFFER_PERCENT)
+                        result["buffer_percent"] < full_buffer)
         attempts[0]["change_made"] = (
-            f"Trimming our own safety buffer from {budget_tool.BUFFER_PERCENT}% to "
+            f"Trimming our own safety buffer from {full_buffer:g}% to "
             f"{result['buffer_percent']:g}% instead of cutting your daily spending."
             if trimmed_only else
             "Compared all available travel, stay and daily-spending combinations; "
@@ -277,7 +286,8 @@ def savings_summary(attempts: list[dict]) -> str:
 def stay_alternatives(stay_options: list[dict], chosen: dict | None, *, budget_inr: int,
                       transport_total: int, days: int, nights: int, travelers: int,
                       style: str, travel_style: str,
-                      anchor: tuple[float, float] | None = None, top: int = 4) -> dict:
+                      anchor: tuple[float, float] | None = None, top: int = 4,
+                      city: str | None = None) -> dict:
     """
     What the traveller can choose INSTEAD of our pick, all scored for them:
 
@@ -290,7 +300,8 @@ def stay_alternatives(stay_options: list[dict], chosen: dict | None, *, budget_i
 
     Pure function: no network, easy to test.
     """
-    ceiling = budget_tool.stay_ceiling(budget_inr, transport_total, days, travelers, style, nights)
+    ceiling = budget_tool.stay_ceiling(budget_inr, transport_total, days, travelers, style,
+                                       nights, city)
     ranked = recommend.rank_stays(stay_options, ceiling, travel_style, anchor)
     chosen_price = recommend.group_price(chosen) if chosen else 0
     chosen_name = chosen["name"] if chosen else None
