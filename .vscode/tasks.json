@@ -1,0 +1,23 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Ghumi: backend",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/python",
+      "windows": {"command": "${workspaceFolder}\\.venv\\Scripts\\python.exe"},
+      "args": ["-m", "uvicorn", "main:app", "--reload"],
+      "options": {"cwd": "${workspaceFolder}/backend"},
+      "problemMatcher": []
+    },
+    {
+      "label": "Ghumi: frontend",
+      "type": "shell",
+      "command": "npm",
+      "windows": {"command": "npm.cmd"},
+      "args": ["run", "dev"],
+      "options": {"cwd": "${workspaceFolder}/frontend"},
+      "problemMatcher": []
+    }
+  ]
+}

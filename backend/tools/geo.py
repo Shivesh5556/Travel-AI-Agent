@@ -10,6 +10,8 @@ it saves a network call for the 40 cities people actually search for.
 """
 
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import config
 from tools import webclient
@@ -69,6 +71,35 @@ KNOWN_CITIES = {
 }
 
 
+class LocationNotFound(ValueError):
+    """No reliable coordinates could be found for a requested city."""
+
+
+_selected_locations: ContextVar[dict] = ContextVar("selected_locations", default={})
+
+
+@contextmanager
+def use_locations(locations: dict):
+    """Scope confirmed city coordinates to one plan and its async child tasks."""
+    resolved = {}
+    for city, location in locations.items():
+        if location is None:
+            continue
+        item = location.model_dump() if hasattr(location, "model_dump") else dict(location)
+        item["source"] = "selected"
+        item["iata"] = item.get("iata") or nearest_known_airport(item["lat"], item["lon"])
+        resolved[city.strip().casefold()] = item
+    token = _selected_locations.set(resolved)
+    try:
+        yield
+    finally:
+        _selected_locations.reset(token)
+
+
+def _candidate_id(source: str, name: str, lat: float, lon: float) -> str:
+    return f"{source}:{name.strip().casefold()}:{lat:.6f},{lon:.6f}"
+
+
 async def geocode(city: str) -> dict:
     """
     Find a city. Returns:
@@ -79,6 +110,8 @@ async def geocode(city: str) -> dict:
     number came from.
     """
     key = city.strip().lower()
+    if key in _selected_locations.get():
+        return dict(_selected_locations.get()[key])
 
     # 1. our own table first (instant, no network)
     if key in KNOWN_CITIES:
@@ -112,8 +145,9 @@ async def geocode(city: str) -> dict:
                 "iata": hit["iata"] or nearest_known_airport(hit["lat"], hit["lon"]),
                 "source": "geoapify"}
 
-    # 3. total fallback so we never crash - centre of India
-    return {"name": city.title(), "lat": 22.9734, "lon": 78.6569, "iata": "DEL", "source": "unknown"}
+    raise LocationNotFound(
+        f"Could not locate {city!r} in India. Select a city from the suggestions "
+        "or try again when the location service is available.")
 
 
 async def search_candidates(query: str, limit: int = 7) -> list[dict]:
@@ -148,9 +182,11 @@ async def search_candidates(query: str, limit: int = 7) -> list[dict]:
             continue
         seen_points.add(point)
         candidates.append({
+            "id": _candidate_id("builtin", key, lat, lon),
             "name": key.title(),
             "subtitle": "India",
             "country": "India",
+            "country_code": "in",
             "state": "",
             "lat": lat,
             "lon": lon,
@@ -158,9 +194,7 @@ async def search_candidates(query: str, limit: int = 7) -> list[dict]:
             "source": "builtin",
         })
 
-    # 2. Nominatim, deliberately NOT restricted to one country - restricting
-    # it would hide exactly the collisions ("Goa, India" vs "Genoa, Italy")
-    # this feature exists to catch.
+    # This planner supports India; international suggestions cannot be planned.
     data = await webclient.get_json(
         config.NOMINATIM_URL,
         params={
@@ -169,6 +203,7 @@ async def search_candidates(query: str, limit: int = 7) -> list[dict]:
             "addressdetails": 1,
             "limit": max(limit, 8),
             "accept-language": "en",
+            "countrycodes": "in",
         },
         label="nominatim_search",
         ttl=60 * 60 * 24,
@@ -212,12 +247,16 @@ async def search_candidates(query: str, limit: int = 7) -> list[dict]:
                 or address.get("state") or hit.get("display_name", query).split(",")[0])
         state = address.get("state", "")
         country = address.get("country", "")
+        if address.get("country_code", "").lower() != "in" and country.lower() != "india":
+            continue
         subtitle = ", ".join(part for part in (state, country) if part) or country
 
         candidates.append({
+            "id": _candidate_id("nominatim", name, lat, lon),
             "name": name,
             "subtitle": subtitle,
             "country": country,
+            "country_code": "in",
             "state": state,
             "lat": lat,
             "lon": lon,
@@ -237,7 +276,7 @@ async def _geoapify_autocomplete(query: str, limit: int) -> list[dict]:
         return []
     data = await webclient.get_json(
         config.GEOAPIFY_AUTOCOMPLETE_URL,
-        params={"text": query, "type": "city", "limit": max(limit, 8),
+        params={"text": query, "type": "city", "limit": max(limit, 8), "filter": "countrycode:in",
                 "lang": "en", "format": "json", "apiKey": config.GEOAPIFY_API_KEY},
         label="geoapify_autocomplete",
         ttl=60 * 60 * 24,
@@ -249,10 +288,14 @@ async def _geoapify_autocomplete(query: str, limit: int) -> list[dict]:
             continue
         name = hit.get("city") or hit.get("name") or hit.get("state") or query
         state, country = hit.get("state", ""), hit.get("country", "")
+        if hit.get("country_code", "").lower() != "in" and country.lower() != "india":
+            continue
         out.append({
+            "id": _candidate_id("geoapify", name, float(lat), float(lon)),
             "name": name,
             "subtitle": ", ".join(x for x in (state, country) if x) or country,
             "country": country,
+            "country_code": "in",
             "state": state,
             "lat": float(lat),
             "lon": float(lon),

@@ -35,7 +35,7 @@ def _day(plan: dict, number: int | None) -> dict | None:
 
 
 def _open_on(stops: list[dict], date_iso: str) -> bool:
-    return not any(dayplanner._closed_on(s, date_iso) for s in stops)
+    return all(dayplanner.available_on(s, date_iso) for s in stops)
 
 
 def _is_edge_day(plan: dict, day: dict) -> bool:
@@ -53,11 +53,14 @@ def _swap_stops(a: dict, b: dict) -> None:
 
 class Fixer:
     def __init__(self, plan: dict, pool: list[dict], restaurants: list[dict],
-                 hotel: tuple[float, float]):
+                 hotel: tuple[float, float], max_stops_per_day: int | None = None):
         self.plan = plan
         self.pool = pool or []
         self.restaurants = restaurants or []
         self.hotel = hotel
+        self.max_stops = (max_stops_per_day or
+                          (plan.get("preferences") or {}).get("max_stops_per_day") or
+                          dayplanner.DEFAULT_MAX_STOPS)
         self.changed: set[int] = set()
 
     # -- helpers ---------------------------------------------------------------
@@ -67,6 +70,13 @@ class Fixer:
 
     def used_names(self) -> set[str]:
         return {s["name"] for d in self.plan.get("days", []) for s in d.get("stops", [])}
+
+    def fits(self, day: dict, stops: list[dict]) -> bool:
+        return (len(stops) <= self.max_stops and _open_on(stops, day["date"]) and
+                dayplanner.day_elapsed_hours(dayplanner.order_for_the_day(stops, *self.hotel),
+                    *self.hotel, day.get("start_hour", dayplanner.DAY_START_HOUR),
+                    bool(day.get("lunch"))) <=
+                day.get("available_hours", dayplanner.MAX_HOURS_PER_DAY))
 
     def drop_weakest(self, day: dict) -> str | None:
         stops = day.get("stops", [])
@@ -86,7 +96,7 @@ class Fixer:
             middle = [d for d in days if not _is_edge_day(self.plan, d) and not d.get("day_trip")
                       and d.get("stops")]
             for other in middle:
-                if _open_on(day["stops"], other["date"]) and _open_on(other["stops"], day["date"]):
+                if self.fits(other, day["stops"]) and self.fits(day, other["stops"]):
                     _swap_stops(day, other)
                     self.refresh(day)
                     self.refresh(other)
@@ -121,14 +131,17 @@ class Fixer:
     def too_light(self, day: dict) -> str:
         if day.get("travel_day"):
             return "planned travel day - left light on purpose"
+        if len(day.get("stops", [])) >= self.max_stops:
+            return "traveller's daily stop limit reached"
         used = self.used_names()
         centre = dayplanner._centre(day.get("stops", [])) or self.hotel
         room = day.get("available_hours", 7) - day.get("hours", 0)
         options = [p for p in self.pool if p["name"] not in used
-                   and not dayplanner._closed_on(p, day["date"])
+                   and dayplanner.available_on(p, day["date"])
                    and p.get("visit_hours", 1.5) <= room + 0.25
                    and haversine_km(p["lat"], p["lon"], centre[0], centre[1]) <= dayplanner.MAX_MOVE_KM
-                   and dayplanner._same_kind_of_day(p, day.get("stops", []), self.hotel)]
+                   and dayplanner._same_kind_of_day(p, day.get("stops", []), self.hotel)
+                   and self.fits(day, day.get("stops", []) + [p])]
         if not options:
             return "no suitable unused place nearby"
         best = max(options, key=lambda p: p.get("score", 0))
@@ -148,7 +161,7 @@ class Fixer:
                 continue
             if bool(other.get("day_trip")) and _is_edge_day(self.plan, day):
                 continue
-            if _open_on(day["stops"], other["date"]) and _open_on(other["stops"], day["date"]):
+            if self.fits(other, day["stops"]) and self.fits(day, other["stops"]):
                 _swap_stops(day, other)
                 self.refresh(day)
                 self.refresh(other)
@@ -182,7 +195,7 @@ class Fixer:
         changed = dayplanner.level_stop_counts(
             stop_lists, [d["date"] for d in days],
             [d.get("available_hours", dayplanner.MAX_HOURS_PER_DAY) for d in days],
-            pool, self.hotel)
+            pool, self.hotel, max_stops=self.max_stops)
         for i in changed:
             days[i]["stops"] = stop_lists[i]
             self.refresh(days[i])
@@ -191,10 +204,34 @@ class Fixer:
         """Even out the number of stops, then new lunch picks for every day that
         changed (no repeats)."""
         self.level_counts()
+        # Repairs can alter dates or load. Enforce hard constraints after all
+        # optional additions and before refreshing lunch or presenting a plan.
+        used_stops = set()
+        for day in self.plan.get("days", []):
+            valid = []
+            for stop in day.get("stops", []):
+                key = stop["name"].strip().casefold()
+                if key in used_stops or not dayplanner.available_on(stop, day["date"]):
+                    continue
+                valid.append(stop)
+                used_stops.add(key)
+            kept, omitted = dayplanner.fit_day(
+                valid, day.get("available_hours", dayplanner.MAX_HOURS_PER_DAY),
+                *self.hotel, max_stops=self.max_stops,
+                start_hour=day.get("start_hour", dayplanner.DAY_START_HOUR),
+                lunch=bool(day.get("lunch") or self.restaurants) and dayplanner.lunch_fits_window(day))
+            day["max_stops_per_day"] = self.max_stops
+            if not dayplanner.lunch_fits_window(day):
+                day["lunch"] = None
+            if kept != day.get("stops", []):
+                day["stops"] = kept
+                day.setdefault("extra_ideas", []).extend(
+                    p["name"] for p in omitted if dayplanner.available_on(p, day["date"]))
+                self.refresh(day)
         used = set()
         for day in self.plan.get("days", []):
             stops = day.get("stops") or []
-            if day["day_number"] in self.changed and stops:
+            if day["day_number"] in self.changed and stops and dayplanner.lunch_fits_window(day):
                 lunch = day.get("lunch")
                 mid = stops[len(stops) // 2]
                 far = (not lunch or lunch.get("lat") is None or haversine_km(
@@ -206,13 +243,16 @@ class Fixer:
                         day["lunch"] = better
             if day.get("lunch"):
                 used.add(day["lunch"]["name"])
+            day["elapsed_hours"] = dayplanner.day_elapsed_hours(
+                day.get("stops", []), *self.hotel,
+                day.get("start_hour", dayplanner.DAY_START_HOUR), bool(day.get("lunch")))
         self.plan["total_km"] = dayplanner.total_distance(self.plan.get("days", []))
 
 
 def fix_plan(plan: dict, findings: list[dict], pool: list[dict], restaurants: list[dict],
-             hotel: tuple[float, float]) -> list[dict]:
+             hotel: tuple[float, float], *, max_stops_per_day: int | None = None) -> list[dict]:
     """Apply every finding; return the review log (finding + what was done)."""
-    fixer = Fixer(plan, pool, restaurants, hotel)
+    fixer = Fixer(plan, pool, restaurants, hotel, max_stops_per_day)
     log = []
     seen = set()
     for f in findings:

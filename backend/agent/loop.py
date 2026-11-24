@@ -11,7 +11,7 @@ The shape of a run:
                  skips the weather call must not produce a plan with no
                  weather in it.
 
-    3. SOLVE     the budget solver runs. Pure Python. Re-plans up to 5 times.
+    3. SOLVE     evaluate the available budget combinations in Python.
 
     4. ROUTE     k-means + nearest neighbour turn the places into days.
 
@@ -53,7 +53,7 @@ this rough order, calling several tools in one go where you can:
 
   1. get_weather for the destination and dates
   2. search_transport for the OUTBOUND route only - the return journey is
-     priced automatically, so do NOT call it a second time with the cities
+     estimated separately from that fare, so do NOT call it again with cities
      swapped. That wastes tokens and the free tier is small.
   3. find_attractions and find_restaurants for the destination
   4. get_local_tips using the traveller's interests
@@ -105,6 +105,16 @@ Rules:
 
 
 async def plan_trip(trip_id: str, req: TripRequest) -> dict:
+    """Keep confirmed locations scoped to this job, including parallel tools."""
+    with geo.use_locations({req.source_city: req.source_location,
+                            req.destination_city: req.destination_location}):
+        # Resolve before spending model tokens. An unknown city is an error,
+        # rather than a plausible itinerary around an unrelated coordinate.
+        await asyncio.gather(geo.geocode(req.source_city), geo.geocode(req.destination_city))
+        return await _plan_trip(trip_id, req)
+
+
+async def _plan_trip(trip_id: str, req: TripRequest) -> dict:
     """Run the whole thing. Returns the finished plan dictionary."""
     started = time.perf_counter()
     events.open_stream(trip_id)
@@ -188,7 +198,7 @@ async def plan_trip(trip_id: str, req: TripRequest) -> dict:
             await events.emit(trip_id, f"replan_{attempt['round']}",
                               attempt["change_made"], kind="replan")
 
-    if decision.get("impossible"):
+    if decision.get("impossible") or not decision.get("fits"):
         await events.emit(trip_id, "impossible", decision["reason"], kind="warn")
         plan = {"ok": False, "reason": decision["reason"],
                 "minimum_needed_inr": decision.get("minimum_needed_inr", 0),
@@ -320,6 +330,14 @@ async def plan_trip(trip_id: str, req: TripRequest) -> dict:
     await events.emit(trip_id, "review", "Double-checking the plan", kind="think")
     plan["agent_review"] = await _review_and_fix(
         trip_id, req, plan, context, (hotel_lat, hotel_lon))
+    violations = critic.validate_plan(plan, prefs)
+    if violations:
+        plan["validation_errors"] = violations
+        plan["ok"] = False
+        plan["reason"] = ("A valid itinerary could not be completed for these constraints. "
+                          + "; ".join(v.get("issue", str(v)) for v in violations[:3]))
+        await events.emit(trip_id, "validation_failed", plan["reason"], kind="warn")
+        return plan
     plan["recommendation_summary"] = recommend.summarize_days(plan["days"])
 
     # ---------- 6: write it up (after the fixes, so the text matches) ----------
@@ -456,6 +474,13 @@ def _with_return_fare(option: dict | None, travelers: int) -> dict | None:
     item["one_way_total_inr"] = one_way_all
     item["return_total_inr"] = one_way_all * 2
     item["return_per_person_inr"] = round(one_way_all * 2 / people)
+    item["outbound_price_is_estimate"] = bool(item.get("price_is_estimate", True))
+    item["return_price_is_estimate"] = True
+    item["price_is_estimate"] = True
+    item["return_fare_note"] = ("Estimated return total: twice the outbound fare. "
+                                "Return availability and fare have not been checked.")
+    source = item.get("source", "")
+    item["source"] = (source + "; " if source else "") + item["return_fare_note"]
     return item
 
 
@@ -614,14 +639,16 @@ async def _review_and_fix(trip_id: str, req: TripRequest, plan: dict, context: d
     findings += await critic.llm_review(critic.plan_to_text(plan), req.as_text(), trip_id)
 
     log = repair.fix_plan(plan, findings, context.get("attractions", []),
-                          context.get("restaurants", []), hotel)
+                          context.get("restaurants", []), hotel,
+                          max_stops_per_day=(plan.get("preferences") or {}).get("max_stops_per_day"))
 
     # second, rules-only pass on the fixed plan (no extra LLM call)
     again = [i for i in critic.rule_checks(plan, req.as_text(), req.destination_city)
              if not i.get("for_traveller") and i.get("kind") not in skip]
     if again:
         log += repair.fix_plan(plan, again, context.get("attractions", []),
-                               context.get("restaurants", []), hotel)
+                               context.get("restaurants", []), hotel,
+                               max_stops_per_day=(plan.get("preferences") or {}).get("max_stops_per_day"))
 
     for entry in log:
         where = f"Day {entry['day']}" if entry.get("day") else "Plan"

@@ -389,7 +389,9 @@ async def client():
     import main
     from database import init_db
     await init_db()
+    main._recent_plans.clear()
     async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://test") as c:
+        assert (await c.post("/api/session")).status_code == 200
         yield c
 
 
@@ -432,9 +434,11 @@ async def test_trip_is_view_once_and_only_its_browser_can_delete_it(client):
     transport = trip["plan"]["transport"]
     assert transport["return_total_inr"] == transport["total_inr"] * 2
     assert transport["travelers"] == 3
-    denied = await client.delete(f"/api/trips/{created['id']}",
-                                 headers={"X-Client-Id": "someone-else-99"})
-    assert denied.status_code == 403
+    async with AsyncClient(transport=ASGITransport(app=__import__("main").app),
+                           base_url="http://test") as stranger:
+        await stranger.post("/api/session")
+        denied = await stranger.delete(f"/api/trips/{created['id']}")
+    assert denied.status_code == 404
     # the browser forgets the trip once it has been viewed
     assert (await client.delete(f"/api/trips/{created['id']}", headers=headers)).status_code == 200
     assert (await client.get(f"/api/trips/{created['id']}")).status_code == 404

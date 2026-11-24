@@ -16,12 +16,16 @@ for fifteen seconds with no idea whether it was working.
 
 import asyncio
 import contextlib
+import hashlib
+import json
+import re
+import secrets
 import time
 from pathlib import Path
 from collections import defaultdict, deque
 
 from pydantic import BaseModel, Field
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -48,6 +52,7 @@ from tools import geo
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     """Runs once when the server starts, and once when it stops."""
+    config.validate_payment_config()
     await init_db()
     await _fail_stale_trips()
     await monitor.purge_old_trips()
@@ -112,38 +117,84 @@ async def _fail_stale_trips():
 # Who is asking (anonymous) and how often
 # ---------------------------------------------------------------------------
 
-def client_id(x_client_id: str | None = Header(default=None)) -> str | None:
-    """The browser's anonymous id (a random UUID kept in localStorage)."""
-    if x_client_id and 8 <= len(x_client_id) <= 64 and x_client_id.replace("-", "").isalnum():
-        return x_client_id
-    return None
-
-
+SESSION_COOKIE = "gg-session"
+_SESSION_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 _recent_plans: dict[str, deque] = defaultdict(deque)
+_rate_last_cleanup = 0.0
+_running_plans: set[str] = set()
+_creation_lock = asyncio.Lock()
+_idempotency: dict[tuple[str, str], tuple[str, str, float]] = {}
+IDEMPOTENCY_TTL_SECONDS = 3600
+MAX_IDEMPOTENCY_ENTRIES = 4096
 
 
-def _rate_limit(key: str) -> None:
-    """Sliding one-hour window, in memory. Enough for a single-server deploy."""
+def _validate_origin(request: Request) -> None:
+    """Reject cookie-authenticated writes from an unrelated browser origin."""
+    origin = request.headers.get("origin")
+    own_origin = str(request.base_url).rstrip("/")
+    allowed = {item.strip() for item in config.CORS_ORIGINS}
+    if origin and origin != own_origin and origin not in allowed:
+        raise HTTPException(403, "This origin cannot modify trips")
+
+
+def client_id(request: Request) -> str:
+    """Private capability, issued in an HttpOnly cookie. Headers cannot forge it."""
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        _validate_origin(request)
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if not _SESSION_PATTERN.fullmatch(token):
+        raise HTTPException(401, "Start a browser session before accessing a trip")
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _require_owner(trip: Trip, owner: str) -> None:
+    # Trips created before private sessions cannot be claimed through their URL.
+    if not trip.owner_id or not secrets.compare_digest(trip.owner_id, owner):
+        raise HTTPException(404, "No trip with that id")
+
+
+def _rate_limit(key: str, limit: int | None = None) -> None:
+    """Independent IP and session windows, bounded to recent callers."""
+    global _rate_last_cleanup
     now = time.monotonic()
+    if now - _rate_last_cleanup >= 60:
+        for old_key, old_window in list(_recent_plans.items()):
+            if not old_window or now - old_window[-1] > 3600:
+                _recent_plans.pop(old_key, None)
+        _rate_last_cleanup = now
     window = _recent_plans[key]
     while window and now - window[0] > 3600:
         window.popleft()
-    if len(window) >= config.MAX_TRIPS_PER_HOUR:
+    limit = config.MAX_TRIPS_PER_HOUR if limit is None else limit
+    if len(window) >= limit:
         retry = int(3600 - (now - window[0])) + 1
-        raise HTTPException(429, f"Too many trips planned from here in the last hour. "
-                                 f"Try again in about {max(1, retry // 60)} minutes.")
+        raise HTTPException(429, "Too many requests. Please try again later.",
+                            headers={"Retry-After": str(retry)})
     window.append(now)
 
 
+def _limit_client(request: Request, owner: str, operation: str, limit: int) -> None:
+    ip = request.client.host if request.client else "unknown"
+    _rate_limit(f"{operation}:ip:{ip}", limit)
+    _rate_limit(f"{operation}:session:{owner}", limit)
+
+
+def _prune_idempotency() -> None:
+    now = time.monotonic()
+    for key, (_, _, expires) in list(_idempotency.items()):
+        if expires <= now:
+            _idempotency.pop(key, None)
+
+
 def _require_admin(x_admin_token: str | None) -> None:
-    if config.ADMIN_TOKEN and x_admin_token != config.ADMIN_TOKEN:
+    if not config.ADMIN_TOKEN or not x_admin_token or not secrets.compare_digest(x_admin_token.encode(), config.ADMIN_TOKEN.encode()):
         raise HTTPException(403, "Admin token required")
 
 
 app = FastAPI(
     title="Ghumi Ghumi",
     description="An agentic travel planner for India. FastAPI + React.",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -162,6 +213,23 @@ app.add_middleware(
 # Basics
 # ---------------------------------------------------------------------------
 
+@app.post("/api/session", tags=["meta"])
+async def start_session(request: Request, response: Response):
+    """Issue a private browser capability without exposing it to JavaScript."""
+    _validate_origin(request)
+    token = request.cookies.get(SESSION_COOKIE, "")
+    if not _SESSION_PATTERN.fullmatch(token):
+        ip = request.client.host if request.client else "unknown"
+        _rate_limit(f"session:ip:{ip}", 120)
+        token = secrets.token_hex(32)
+    response.set_cookie(
+        SESSION_COOKIE, token, httponly=True, samesite="lax", path="/",
+        secure=config.SESSION_COOKIE_SECURE or request.url.scheme == "https",
+        max_age=config.SESSION_COOKIE_MAX_AGE,
+    )
+    return {"ready": True}
+
+
 @app.get("/api/health", tags=["meta"])
 async def health():
     """What is switched on. The frontend shows this in the footer."""
@@ -177,9 +245,9 @@ async def meta():
     return {
         "interests": INTEREST_CHOICES,
         "config": status,
-        "note": ("Hotel prices are estimates. Flight fares are real only if a "
-                 "Duffel key is configured. Everything else comes from live "
-                 "free APIs."),
+        "note": ("This is an estimated planning budget. Hotel, train, bus and "
+                 "return fares are estimates. Duffel test keys return demo "
+                 "outbound inventory. Confirm availability with providers."),
     }
 
 
@@ -199,7 +267,8 @@ class TranslateRequest(BaseModel):
 
 
 @app.post("/api/translate", tags=["meta"])
-async def translate_texts(body: TranslateRequest):
+async def translate_texts(body: TranslateRequest, request: Request,
+                          owner: str = Depends(client_id)):
     """
     Translate plan text (day descriptions, tips, warnings...) into another
     language. Returns the strings in the same order. Place names, numbers and
@@ -208,7 +277,10 @@ async def translate_texts(body: TranslateRequest):
     """
     if body.lang not in translate.LANGUAGES:
         raise HTTPException(status_code=400, detail=f"Unsupported language '{body.lang}'")
-    texts = [t[:1500] for t in body.texts]
+    if any(len(t) > 1500 for t in body.texts) or sum(map(len, body.texts)) > config.MAX_TRANSLATION_CHARS:
+        raise HTTPException(422, "Translation text exceeds the request size limit")
+    _limit_client(request, owner, "translate", config.MAX_TRANSLATIONS_PER_HOUR)
+    texts = body.texts
     translations, complete = await translate.translate_with_status(texts, body.lang)
     return {"lang": body.lang, "translations": translations, "complete": complete}
 
@@ -250,7 +322,8 @@ def _to_summary(trip: Trip) -> dict:
 @app.post("/api/trips", response_model=TripSummary, status_code=202, tags=["trips"])
 async def create_trip(req: TripRequest, background: BackgroundTasks, request: Request,
                       session: AsyncSession = Depends(get_session),
-                      owner: str | None = Depends(client_id)):
+                      owner: str = Depends(client_id),
+                      idempotency_key: str | None = Header(default=None, min_length=8, max_length=128)):
     """
     Start planning a trip.
 
@@ -266,34 +339,67 @@ async def create_trip(req: TripRequest, background: BackgroundTasks, request: Re
             "missing": missing,
         })
 
-    _rate_limit(owner or (request.client.host if request.client else "anon"))
+    fingerprint = hashlib.sha256(json.dumps(
+        req.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    async with _creation_lock:
+        _prune_idempotency()
+        if idempotency_key:
+            previous = _idempotency.get((owner, idempotency_key))
+            if previous:
+                previous_fingerprint, previous_id, _ = previous
+                if fingerprint != previous_fingerprint:
+                    raise HTTPException(409, "This idempotency key was used for a different trip")
+                previous_trip = await session.get(Trip, previous_id)
+                if previous_trip is None:
+                    raise HTTPException(409, "That trip was deleted; submit with a new idempotency key")
+                _require_owner(previous_trip, owner)
+                return _to_summary(previous_trip)
+        if len(_running_plans) >= config.MAX_CONCURRENT_PLANS:
+            raise HTTPException(429, "The planner is busy. Please try again shortly.",
+                                headers={"Retry-After": "10"})
+        _limit_client(request, owner, "plan", config.MAX_TRIPS_PER_HOUR)
 
-    trip = Trip(
-        owner_id=owner,
-        source_city=req.source_city,
-        destination_city=req.destination_city,
-        start_date=req.start_date.isoformat(),
-        end_date=req.end_date.isoformat(),
-        travelers=req.travelers,
-        budget_inr=req.budget_inr,
-        interests=req.interests,
-        travel_style=req.travel_style,
-        notes=req.notes,
-        status="running",
-    )
-    session.add(trip)
-    await session.commit()
-    await session.refresh(trip)
+        trip = Trip(
+            owner_id=owner,
+            source_city=req.source_city,
+            destination_city=req.destination_city,
+            start_date=req.start_date.isoformat(),
+            end_date=req.end_date.isoformat(),
+            travelers=req.travelers,
+            budget_inr=req.budget_inr,
+            interests=req.interests,
+            travel_style=req.travel_style,
+            notes=req.notes,
+            status="running",
+        )
+        session.add(trip)
+        await session.commit()
+        await session.refresh(trip)
 
-    # Open the event stream BEFORE the background task starts, otherwise the
-    # first few events can be emitted before anyone is listening.
-    events.open_stream(trip.id)
-    background.add_task(_run_agent, trip.id, req)
+        _running_plans.add(trip.id)
+        if idempotency_key:
+            while len(_idempotency) >= MAX_IDEMPOTENCY_ENTRIES:
+                _idempotency.pop(next(iter(_idempotency)))
+            _idempotency[(owner, idempotency_key)] = (
+                fingerprint, trip.id, time.monotonic() + IDEMPOTENCY_TTL_SECONDS)
 
-    return _to_summary(trip)
+        # Open the event stream BEFORE the background task starts, otherwise the
+        # first few events can be emitted before anyone is listening.
+        events.open_stream(trip.id)
+        background.add_task(_run_agent, trip.id, req)
+
+        return _to_summary(trip)
 
 
 async def _run_agent(trip_id: str, req: TripRequest):
+    try:
+        await _run_agent_work(trip_id, req)
+    finally:
+        _running_plans.discard(trip_id)
+
+
+async def _run_agent_work(trip_id: str, req: TripRequest):
     """Runs in the background. Saves whatever the agent produces."""
     try:
         plan = await plan_trip(trip_id, req)
@@ -341,7 +447,8 @@ def get_session_direct():
 
 
 @app.get("/api/trips/{trip_id}", response_model=TripDetail, tags=["trips"])
-async def get_trip(trip_id: str, session: AsyncSession = Depends(get_session)):
+async def get_trip(trip_id: str, session: AsyncSession = Depends(get_session),
+                   owner: str = Depends(client_id)):
     result = await session.execute(
         select(Trip).where(Trip.id == trip_id).options(selectinload(Trip.alerts)))
     trip = result.scalar_one_or_none()
@@ -349,6 +456,7 @@ async def get_trip(trip_id: str, session: AsyncSession = Depends(get_session)):
     if trip is None:
         raise HTTPException(404, "No trip with that id")
 
+    _require_owner(trip, owner)
     data = _to_summary(trip)
     data.update({
         "interests": trip.interests or [],
@@ -370,12 +478,11 @@ async def get_trip(trip_id: str, session: AsyncSession = Depends(get_session)):
 
 @app.delete("/api/trips/{trip_id}", tags=["trips"])
 async def delete_trip(trip_id: str, session: AsyncSession = Depends(get_session),
-                      owner: str | None = Depends(client_id)):
+                      owner: str = Depends(client_id)):
     trip = await session.get(Trip, trip_id)
     if trip is None:
         raise HTTPException(404, "No trip with that id")
-    if trip.owner_id and trip.owner_id != owner:
-        raise HTTPException(403, "Only the person who planned this trip can delete it")
+    _require_owner(trip, owner)
     await session.delete(trip)
     await session.commit()
     events.cleanup(trip_id)
@@ -383,7 +490,8 @@ async def delete_trip(trip_id: str, session: AsyncSession = Depends(get_session)
 
 
 @app.get("/api/trips/{trip_id}/stream", tags=["trips"])
-async def stream_trip(trip_id: str, session: AsyncSession = Depends(get_session)):
+async def stream_trip(trip_id: str, session: AsyncSession = Depends(get_session),
+                      owner: str = Depends(client_id)):
     """
     Server-Sent Events: the live agent trace.
 
@@ -399,6 +507,7 @@ async def stream_trip(trip_id: str, session: AsyncSession = Depends(get_session)
     trip = await session.get(Trip, trip_id)
     if trip is None:
         raise HTTPException(404, "No trip with that id")
+    _require_owner(trip, owner)
     if trip.status != "running":
         saved = list(trip.trace or [])
 
@@ -452,8 +561,10 @@ async def stream_trip(trip_id: str, session: AsyncSession = Depends(get_session)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/monitor/run", tags=["monitor"])
-async def run_monitor_now(trip_id: str | None = None,
-                          x_admin_token: str | None = Header(default=None)):
+async def run_monitor_now(request: Request, trip_id: str | None = None,
+                          x_admin_token: str | None = Header(default=None),
+                          session: AsyncSession = Depends(get_session),
+                          owner: str = Depends(client_id)):
     """
     Force the background monitor to run right now - for one trip (what the
     "Re-check this trip" button does) or, with the admin token when one is
@@ -464,6 +575,12 @@ async def run_monitor_now(trip_id: str | None = None,
     """
     if not trip_id:
         _require_admin(x_admin_token)
+    else:
+        trip = await session.get(Trip, trip_id)
+        if trip is None:
+            raise HTTPException(404, "No trip with that id")
+        _require_owner(trip, owner)
+    _limit_client(request, owner, "monitor", config.MAX_MONITOR_RUNS_PER_HOUR)
     # Also un-blacklist any map server we gave up on. Pressing this button
     # after a failed plan is the natural "try again properly" action.
     from tools import webclient
@@ -479,11 +596,13 @@ async def run_monitor_now(trip_id: str | None = None,
 
 @app.post("/api/trips/{trip_id}/checkout", tags=["checkout"])
 async def start_checkout(trip_id: str, traveler: TravelerDetails,
-                         session: AsyncSession = Depends(get_session)):
+                         session: AsyncSession = Depends(get_session),
+                         owner: str = Depends(client_id)):
     """Create a Razorpay test order for the planned trip."""
     trip = await session.get(Trip, trip_id)
     if trip is None:
         raise HTTPException(404, "No trip with that id")
+    _require_owner(trip, owner)
     if trip.status != "done":
         raise HTTPException(400, "This trip has not finished planning yet")
     if not config.PAYMENTS_ENABLED:
@@ -519,7 +638,8 @@ async def start_checkout(trip_id: str, traveler: TravelerDetails,
 
 @app.post("/api/trips/{trip_id}/verify", tags=["checkout"])
 async def verify_payment(trip_id: str, body: dict,
-                         session: AsyncSession = Depends(get_session)):
+                         session: AsyncSession = Depends(get_session),
+                         owner: str = Depends(client_id)):
     """
     Razorpay's widget calls back with three values. We check the signature
     ourselves before believing any of it.
@@ -528,6 +648,7 @@ async def verify_payment(trip_id: str, body: dict,
     if trip is None:
         raise HTTPException(404, "No trip with that id")
 
+    _require_owner(trip, owner)
     plan = dict(trip.plan or {})
     checkout = plan.get("checkout") or {}
 

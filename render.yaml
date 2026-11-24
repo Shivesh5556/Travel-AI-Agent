@@ -35,7 +35,11 @@ services:
         value: "10"
       - key: TRIP_TTL_HOURS
         value: "6"
-      # Free instances have no persistent disk. That is fine here: trips are
-      # view-once, so SQLite on the temporary disk is all we need.
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: MAX_CONCURRENT_PLANS
+        value: "4"
+      # Temporary SQLite is suitable for a short-lived demo. Restarting a free
+      # instance can lose active trips; use managed Postgres for persistence.
       - key: DATABASE_URL
         value: sqlite+aiosqlite:///./ghumi.db

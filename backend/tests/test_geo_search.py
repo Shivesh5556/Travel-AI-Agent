@@ -60,13 +60,12 @@ async def test_disambiguates_same_name_different_places():
     names = [r["name"] for r in results]
 
     assert any("Goa" in n for n in names)
-    assert any("Genoa" in n for n in names)
+    assert not any("Genoa" in n for n in names)
     # each candidate should carry enough context to tell them apart
     india = next(r for r in results if r["name"] == "Goa")
-    italy = next(r for r in results if "Genoa" in r["name"])
     assert india["country"] == "India"
-    assert italy["country"] == "Italy"
-    assert india["subtitle"] != italy["subtitle"]
+    assert india["country_code"] == "in"
+    assert india["id"]
 
 
 async def test_filters_out_non_place_results():
@@ -91,5 +90,6 @@ async def test_geo_search_endpoint(client):
     assert response.status_code == 200
     body = response.json()
     assert body["query"] == "goa"
-    assert len(body["results"]) >= 2
-    assert any("Genoa" in r["name"] for r in body["results"])
+    assert len(body["results"]) >= 1
+    assert all(r["country_code"] == "in" for r in body["results"])
+    assert not any("Genoa" in r["name"] for r in body["results"])

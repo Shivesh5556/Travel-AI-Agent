@@ -32,6 +32,10 @@ async def create_order(amount_inr: int, receipt: str) -> dict:
     Create an order. Razorpay works in paise, so we multiply by 100.
     Returns the order dict, whose "id" the frontend hands to the widget.
     """
+    try:
+        config.validate_payment_config()
+    except ValueError as exc:
+        raise PaymentsNotConfigured(str(exc)) from exc
     if not config.PAYMENTS_ENABLED:
         raise PaymentsNotConfigured(
             "Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env to enable checkout")
@@ -68,7 +72,13 @@ def verify_signature(order_id: str, payment_id: str, signature: str) -> bool:
     """
     if not config.PAYMENTS_ENABLED:
         return False
-    if not (order_id and payment_id and signature):
+    try:
+        config.validate_payment_config()
+    except ValueError:
+        return False
+    if not all(isinstance(value, str) and value for value in (order_id, payment_id, signature)):
+        return False
+    if len(signature) != 64 or any(c not in "0123456789abcdef" for c in signature):
         return False
 
     expected = hmac.new(

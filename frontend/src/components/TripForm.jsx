@@ -62,12 +62,14 @@ function Stepper({ id, label, sub, value, min, max, onChange }) {
   );
 }
 
-export default function TripForm({ interests, onSubmit, busy, prefill }) {
+export default function TripForm({ interests, onSubmit, busy, ready = true, prefill }) {
   const { t } = useI18n();
   const { money } = useMoney();
   const [form, setForm] = useState({
     source_city: "Delhi",
     destination_city: "Jaipur",
+    source_location: null,
+    destination_location: null,
     start_date: defaultDate(10),
     end_date: defaultDate(13),
     budget_inr: 25000,
@@ -86,6 +88,7 @@ export default function TripForm({ interests, onSubmit, busy, prefill }) {
     setForm((f) => ({
       ...f,
       destination_city: prefill.name,
+      destination_location: null,
       end_date: addDays(start, Math.max(0, prefill.days - 1)),
       budget_inr: prefill.perPerson * (adults + children),
     }));
@@ -108,13 +111,22 @@ export default function TripForm({ interests, onSubmit, busy, prefill }) {
   }
 
   function swap() {
-    setForm((f) => ({ ...f, source_city: f.destination_city, destination_city: f.source_city }));
+    setForm((f) => ({ ...f, source_city: f.destination_city, destination_city: f.source_city,
+      source_location: f.destination_location, destination_location: f.source_location }));
   }
 
-  function submit() {
+  function submit(event) {
+    event.preventDefault();
+    if (busy || !ready) return;
     setError("");
+    if (!form.start_date || !form.end_date) return setError("Both dates are needed.");
+    if (travelers > 20) return setError("At most 20 travellers are supported.");
     if (!form.source_city.trim() || !form.destination_city.trim()) return setError("Both cities are needed.");
-    if (form.source_city.trim().toLowerCase() === form.destination_city.trim().toLowerCase())
+    const sameName = form.source_city.trim().toLowerCase() === form.destination_city.trim().toLowerCase();
+    const selectedBoth = form.source_location && form.destination_location;
+    const samePoint = selectedBoth && Math.abs(form.source_location.lat - form.destination_location.lat) < 0.001
+      && Math.abs(form.source_location.lon - form.destination_location.lon) < 0.001;
+    if (samePoint || (sameName && !selectedBoth))
       return setError("Leaving from and going to are the same city.");
     if (form.start_date < today) return setError("The trip cannot start in the past.");
     if (form.end_date < form.start_date) return setError("The return date is before the start date.");
@@ -132,6 +144,8 @@ export default function TripForm({ interests, onSubmit, busy, prefill }) {
     onSubmit({
       source_city: form.source_city,
       destination_city: form.destination_city,
+      ...(form.source_location ? { source_location: form.source_location } : {}),
+      ...(form.destination_location ? { destination_location: form.destination_location } : {}),
       start_date: form.start_date,
       end_date: form.end_date,
       travelers,
@@ -145,7 +159,7 @@ export default function TripForm({ interests, onSubmit, busy, prefill }) {
   }
 
   return (
-    <div className="card form-card" id="planner">
+    <form className="card form-card" id="planner" onSubmit={submit}>
       <div className="form-head">
         <div>
           <p className="eyebrow">{t("Plan my trip")}</p>
@@ -157,9 +171,9 @@ export default function TripForm({ interests, onSubmit, busy, prefill }) {
       {error && <div className="error-box" role="alert">{error}</div>}
 
       <div className="route-row">
-        <CityAutocomplete id="from" label={t("Leaving from")} value={form.source_city} onChange={(t) => set("source_city", t)} placeholder="Dehradun" />
+        <CityAutocomplete id="from" label={t("Leaving from")} value={form.source_city} location={form.source_location} onChange={(text, location) => setForm((f) => ({ ...f, source_city: text, source_location: location }))} placeholder="Dehradun" />
         <button type="button" className="swap-btn" onClick={swap} aria-label={t("Swap cities")} title={t("Swap cities")}>⇄</button>
-        <CityAutocomplete id="to" label={t("Going to")} value={form.destination_city} onChange={(t) => set("destination_city", t)} placeholder="Jaipur" />
+        <CityAutocomplete id="to" label={t("Going to")} value={form.destination_city} location={form.destination_location} onChange={(text, location) => setForm((f) => ({ ...f, destination_city: text, destination_location: location }))} placeholder="Jaipur" />
       </div>
 
       <div className="field-row">
@@ -188,7 +202,7 @@ export default function TripForm({ interests, onSubmit, busy, prefill }) {
         <label htmlFor="budget">{t("Total budget")}</label>
         <div className="budget-input">
           <span className="num">₹</span>
-          <input id="budget" type="number" min="1000" step="1000" value={form.budget_inr} onChange={(e) => set("budget_inr", e.target.value)} />
+          <input id="budget" type="number" min="1000" step="1" value={form.budget_inr} onChange={(e) => set("budget_inr", e.target.value)} />
         </div>
         <input
           type="range" min="3000" max="200000" step="1000"
@@ -208,7 +222,7 @@ export default function TripForm({ interests, onSubmit, busy, prefill }) {
           <span><strong className="num">{money(budget / travelers / days)}</strong> {t("per person per day")}</span>
         </div>
         <div className="hint">
-          {t("For everyone, everything included. This is a hard limit: the planner re-plans until it fits.")}
+          {t("For everyone together. The planner fits estimated costs to your limit; confirm current prices before booking.")}
         </div>
       </div>
 
@@ -234,7 +248,7 @@ export default function TripForm({ interests, onSubmit, busy, prefill }) {
             </button>
           ))}
         </div>
-        <div className="hint">{t("Your budget is still a hard limit either way. This decides what gets given up first if it does not fit.")}</div>
+        <div className="hint">{t("Your budget guides every choice. Travel style decides which estimated costs the planner trims first.")}</div>
       </div>
 
       <div className="field">
@@ -243,10 +257,10 @@ export default function TripForm({ interests, onSubmit, busy, prefill }) {
         <span className="hint">{t("The planner reads this: diet, pace, things to skip and places you must see are all applied.")}</span>
       </div>
 
-      <button className="btn btn-primary btn-wide" onClick={submit} disabled={busy}>
-        {busy ? t("Planning…") : t("Make it fit →")}
+      <button type="submit" className="btn btn-primary btn-wide" disabled={busy || !ready}>
+        {!ready ? t("Connecting…") : busy ? t("Planning…") : t("Make it fit →")}
       </button>
       <p className="hint center">{t("Free to plan · real places and weather · estimates are always labelled")}</p>
-    </div>
+    </form>
   );
 }

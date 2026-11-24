@@ -10,10 +10,12 @@ The critic agent later reads this to catch things like "you planned a trek
 on the one day it rains".
 """
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import config
 from tools import webclient
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # Open-Meteo returns a WMO weather code. This maps it to something readable.
 WEATHER_CODES = {
@@ -57,10 +59,12 @@ async def get_forecast(lat: float, lon: float, start_date: str, end_date: str) -
     """
     start = datetime.strptime(start_date, "%Y-%m-%d").date()
     end = datetime.strptime(end_date, "%Y-%m-%d").date()
-    days_away = (start - date.today()).days
+    today = datetime.now(IST).date()
+    horizon = today + timedelta(days=15)
+    forecast = None
 
     # Open-Meteo only forecasts about 16 days ahead.
-    if 0 <= days_away <= 16:
+    if today <= start <= horizon:
         data = await webclient.get_json(
             config.OPEN_METEO_URL,
             params={
@@ -69,27 +73,43 @@ async def get_forecast(lat: float, lon: float, start_date: str, end_date: str) -
                 "daily": "weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
                 "timezone": "Asia/Kolkata",
                 "start_date": start_date,
-                "end_date": end_date,
+                "end_date": min(end, horizon).isoformat(),
             },
             label="open_meteo_forecast",
             ttl=60 * 60 * 3,   # weather changes, only cache for 3 hours
         )
 
         if data and "daily" in data:
-            return _parse_open_meteo(data)
-        why = "the forecast service did not answer"
+            forecast = _parse_open_meteo(data)
+            covered = {d["date"] for d in forecast["days"]}
+            expected = {(start + timedelta(days=i)).isoformat()
+                        for i in range((end - start).days + 1)}
+            if expected <= covered:
+                return forecast
+            why = "part of the trip is beyond the forecast window"
+        else:
+            why = "the forecast service did not answer"
     else:
         why = "the trip is beyond the 16-day forecast window"
 
-    climate = await _climate_from_history(lat, lon, start, end)
+    climate_start = start
+    if forecast and forecast["days"]:
+        climate_start = datetime.strptime(min(expected - covered), "%Y-%m-%d").date()
+    climate = await _climate_from_history(lat, lon, climate_start, end)
     if climate:
         climate["source"] = climate["source"].split(" - ")[0] + f" - {why}"
+    else:
+        climate = _seasonal_estimate(climate_start, end, lat, lon)
+        climate["source"] = climate["source"].split(" - ")[0] + f" - {why}"
+    if not forecast or not forecast["days"]:
         return climate
-
-    # No forecast and no archive -> regional seasonal estimate
-    estimate = _seasonal_estimate(start, end, lat, lon)
-    estimate["source"] = estimate["source"].split(" - ")[0] + f" - {why}"
-    return estimate
+    merged = {d["date"]: d for d in climate["days"]}
+    merged.update({d["date"]: d for d in forecast["days"]})
+    days = [merged[k] for k in sorted(merged)]
+    return {"days": days, "rainy_days": [d["date"] for d in days if d.get("is_rainy")],
+            "is_real_forecast": False, "has_forecast": True,
+            "forecast_dates": [d["date"] for d in forecast["days"]],
+            "source": "Open-Meteo forecast for near dates; " + climate["source"] + " for remaining dates"}
 
 
 def _same_day_in(year: int, d: date) -> date:
@@ -159,6 +179,7 @@ async def _climate_from_history(lat: float, lon: float, start: date, end: date,
             "low_c": low, "high_c": high,
             "rain_chance": chance,
             "is_rainy": is_rainy,
+            "is_real_forecast": False,
         })
         if is_rainy:
             rainy.append(current.isoformat())
@@ -215,18 +236,18 @@ def region_for(lat: float | None, lon: float | None) -> str:
 def _seasonal_estimate(start: date, end: date, lat: float | None = None,
                        lon: float | None = None) -> dict:
     region = region_for(lat, lon)
-    chance = REGION_RAIN[region][start.month - 1]
-    rainy_month = chance >= 50
-    description, low, high = SEASONAL_HINT[start.month]
     d_low, d_high = REGION_TEMP_SHIFT[region]
-    if region != "plains":
-        description = ("Rainy season, showers likely" if rainy_month
-                       else "Mostly dry" if chance <= 10 else "Some showers possible")
-    low, high = low + d_low, high + d_high
 
     days = []
     current = start
     while current <= end:
+        chance = REGION_RAIN[region][current.month - 1]
+        rainy_month = chance >= 50
+        description, low, high = SEASONAL_HINT[current.month]
+        if region != "plains":
+            description = ("Rainy season, showers likely" if rainy_month
+                           else "Mostly dry" if chance <= 10 else "Some showers possible")
+        low, high = low + d_low, high + d_high
         days.append({
             "date": current.isoformat(),
             "description": description + " (seasonal average, not a forecast)",
@@ -234,12 +255,13 @@ def _seasonal_estimate(start: date, end: date, lat: float | None = None,
             "high_c": high,
             "rain_chance": chance,
             "is_rainy": rainy_month,
+            "is_real_forecast": False,
         })
         current += timedelta(days=1)
 
     return {
         "days": days,
-        "rainy_days": [d["date"] for d in days] if rainy_month else [],
+        "rainy_days": [d["date"] for d in days if d["is_rainy"]],
         "is_real_forecast": False,
         "source": f"seasonal average for this region ({region}) - the trip is beyond the "
                   f"16-day forecast window",
@@ -266,6 +288,7 @@ def _parse_open_meteo(data: dict) -> dict:
             "high_c": daily["temperature_2m_max"][i],
             "rain_chance": daily.get("precipitation_probability_max", [None] * 20)[i],
             "is_rainy": is_rainy,
+            "is_real_forecast": True,
         })
 
     return {

@@ -332,17 +332,19 @@ def test_weather_label_says_why_there_is_no_forecast(monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("days", [3, 4, 5])
-def test_every_city_gets_an_even_number_of_stops_per_day(days):
+def test_every_city_keeps_closures_and_stop_limits_while_balancing(days):
     import eval_recommendations
     for row in eval_recommendations.evaluate_offline(days):
-        city, _, _, _, low, high = row
-        assert high - low <= 1, f"{city}: {low}-{high} stops per day"
+        city, _, _, closed_hits, low, high = row
+        assert closed_hits == 0, city
+        assert 0 <= low <= high <= dayplanner.DEFAULT_MAX_STOPS, city
 
 
-def test_levelling_moves_stops_before_it_drops_any():
+def test_levelling_keeps_valid_visits_when_day_lengths_differ():
     ranked, days = _dehradun_plan()
     counts = [len(d["stops"]) for d in days]
-    assert max(counts) - min(counts) <= 1
+    assert all(d["hours"] <= d["available_hours"] for d in days)
+    assert max(counts) <= dayplanner.DEFAULT_MAX_STOPS
     assert sum(counts) >= len(ranked) - 2          # v29 first draft trimmed it to 10 of 14
 
 

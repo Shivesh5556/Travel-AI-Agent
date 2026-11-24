@@ -22,8 +22,10 @@ pytestmark = pytest.mark.asyncio
 @pytest_asyncio.fixture
 async def client():
     await init_db()
+    main._recent_plans.clear()
     transport = ASGITransport(app=main.app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
+        assert (await c.post("/api/session")).status_code == 200
         yield c
 
 
@@ -54,8 +56,9 @@ class TestBasics:
         assert response.status_code == 200
         assert "Nature" in response.json()["interests"]
 
-    async def test_metrics_endpoint(self, client):
-        response = await client.get("/api/metrics")
+    async def test_metrics_endpoint(self, client, monkeypatch):
+        monkeypatch.setattr(main.config, "ADMIN_TOKEN", "test-admin-token")
+        response = await client.get("/api/metrics", headers={"X-Admin-Token": "test-admin-token"})
         assert response.status_code == 200
         assert "total_calls" in response.json()
 
@@ -94,7 +97,7 @@ class TestPlanning:
         assert response.status_code == 202
         data = response.json()
         assert data["status"] == "running"
-        assert len(data["id"]) == 10
+        assert len(data["id"]) == 32
 
     async def test_the_plan_actually_completes(self, client):
         response = await client.post("/api/trips", json=a_trip())

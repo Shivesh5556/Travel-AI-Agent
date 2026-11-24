@@ -26,7 +26,7 @@ export default function BudgetPanel({ budget }) {
 
       <div className={`verdict ${fits ? "fits" : "over"}`}>
         <div>
-          <span className="label">{fits ? t("Fits your budget") : t("Over budget")}</span>
+          <span className="label">{fits ? t("Estimated to fit your budget") : t("Estimated over budget")}</span>
           <div className="big num">{money(total)}</div>
         </div>
         <div style={{ textAlign: "right" }}>
@@ -75,12 +75,13 @@ export default function BudgetPanel({ budget }) {
             </tr>
           ))}
           <tr>
-            <td>{budget.budget_inr ? t("Total for the whole trip") : t("Total for everything")}</td>
+            <td>{t("Estimated whole-trip total")}</td>
             <td>{money(total)}</td>
           </tr>
         </tbody>
       </table>
 
+      <p className="hint">{t("Prices and daily spending are estimates. Confirm current fares, fees and availability with providers before booking.")}</p>
       <p className="hint" style={{ marginTop: "12px" }}>
         {tr(`That is ${money(budget.per_person_inr)} per person for the whole trip, or about ${money(budget.per_day_inr)} a day for everyone together. Daily spending assumed at the ${budget.style} level.`)}
       </p>
