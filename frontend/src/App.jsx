@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, forgetTrip, streamTrip } from "./api.js";
+import { api, streamTrip } from "./api.js";
 import { CurrencyProvider } from "./currency.jsx";
 import { LanguageSwitcher, useI18n } from "./i18n.jsx";
 import Checkout from "./components/Checkout.jsx";
@@ -9,13 +9,12 @@ import PlanView from "./components/PlanView.jsx";
 import SetupNeeded from "./components/SetupNeeded.jsx";
 import TripForm from "./components/TripForm.jsx";
 
-/*
-  The whole app.
+const ACTIVE_TRIP_KEY = "gg-active-trip";
 
-  No router library and no saved-trips list. A trip lives only while you are
-  looking at it: when you plan another trip, close the tab or refresh, it is
-  deleted from the server (see forgetTrip). Nothing is kept for later.
-*/
+function restoreTripId() {
+  try { return sessionStorage.getItem(ACTIVE_TRIP_KEY) || null; }
+  catch { return null; }
+}
 
 export default function App() {
   return (
@@ -30,10 +29,13 @@ function AppInner() {
   const [config, setConfig] = useState(null);
   const [interests, setInterests] = useState([]);
 
-  const [tripId, setTripId] = useState(null);
+  const [tripId, setTripId] = useState(restoreTripId);
   const [trip, setTrip] = useState(null);
   const [events, setEvents] = useState([]);
   const [running, setRunning] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const creatingRef = useRef(false);
+  const submissionRef = useRef(null);
   const [error, setError] = useState("");
   const [checkingOut, setCheckingOut] = useState(false);
   const [prefill, setPrefill] = useState(null);
@@ -49,19 +51,14 @@ function AppInner() {
       .catch((e) => setError("Cannot reach the backend. Is uvicorn running? " + e.message));
   }, []);
 
-  // A trip is viewed once: leaving the page (close, refresh, navigate away)
-  // deletes it from the server.
-  const tripRef = useRef(null);
+  // Only the opaque current-trip id is stored in this tab. The server keeps
+  // plans for up to six hours; refresh can resume without storing plan or PII.
   useEffect(() => {
-    tripRef.current = tripId;
+    try {
+      if (tripId) sessionStorage.setItem(ACTIVE_TRIP_KEY, tripId);
+      else sessionStorage.removeItem(ACTIVE_TRIP_KEY);
+    } catch { /* storage blocked: the open trip still works */ }
   }, [tripId]);
-  useEffect(() => {
-    const onLeave = () => {
-      if (tripRef.current) forgetTrip(tripRef.current);
-    };
-    window.addEventListener("pagehide", onLeave);
-    return () => window.removeEventListener("pagehide", onLeave);
-  }, []);
 
   /*
     Watch the agent work.
@@ -146,13 +143,26 @@ function AppInner() {
   }, [tripId]);
 
   async function startTrip(body) {
+    if (creatingRef.current) return;
+    creatingRef.current = true;
+    setCreating(true);
     setError("");
+    const fingerprint = JSON.stringify(body);
+    if (submissionRef.current?.fingerprint !== fingerprint) {
+      submissionRef.current = {
+        fingerprint,
+        key: globalThis.crypto?.randomUUID?.() || `trip-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      };
+    }
     try {
-      const created = await api.createTrip(body);
+      const created = await api.createTrip(body, submissionRef.current.key);
       setTripId(created.id);
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (e) {
       setError(e.message);
+    } finally {
+      creatingRef.current = false;
+      setCreating(false);
     }
   }
 
@@ -165,8 +175,13 @@ function AppInner() {
     }
   }
 
-  function goHome() {
-    if (tripId) forgetTrip(tripId);
+  async function goHome() {
+    if (creatingRef.current) return;
+    if (tripId) {
+      try { await api.deleteTrip(tripId); }
+      catch (e) { setError(e.message); return; }
+    }
+    submissionRef.current = null;
     setTripId(null);
     setTrip(null);
     setEvents([]);
@@ -221,16 +236,16 @@ function AppInner() {
                   {t("We'll make it fit")} <em>{t("what you've got")}</em>.
                 </h2>
                 <p className="lede">
-                  {t("Name a place and a number. Ghumi Ghumi looks up real fares, real weather and real places, then keeps re-planning — swapping the flight for a train, the resort for a guesthouse — until the trip actually fits. No “sorry, out of budget” at the last screen.")}
+                  {t("Name a place and a number. Ghumi Ghumi checks available fares, weather and places, then adjusts transport and stays to fit estimated costs to your budget. When the trip cannot fit, it explains why.")}
                 </p>
                 <ul className="usp">
-                  <li><span className="usp-n">01</span><div><strong>{t("Budget is a rule, not a filter")}</strong><span>{t("Re-plans until the number works, and shows every round.")}</span></div></li>
+                  <li><span className="usp-n">01</span><div><strong>{t("Budget is a rule, not a filter")}</strong><span>{t("Adjusts estimated costs to your limit and explains any shortfall.")}</span></div></li>
                   <li><span className="usp-n">02</span><div><strong>{t("Real places, real fares")}</strong><span>{t("Anything estimated says so on its face.")}</span></div></li>
                   <li><span className="usp-n">03</span><div><strong>{t("Worth your time, with proof")}</strong><span>{t("Every place is scored 0–100 on your interests, quality evidence, cost and route — and the reason is shown.")}</span></div></li>
                   <li><span className="usp-n">04</span><div><strong>{t("Keeps watching")}</strong><span>{t("If the forecast turns, it tells you which days to swap.")}</span></div></li>
                 </ul>
               </div>
-              <TripForm interests={interests} onSubmit={startTrip} busy={running} prefill={prefill} />
+              <TripForm interests={interests} onSubmit={startTrip} busy={creating || running} ready={Boolean(config)} prefill={prefill} />
             </div>
             <div className="hero-road" aria-hidden="true" />
           </section>
@@ -270,7 +285,8 @@ function AppInner() {
           )}
 
           <div className="trip-foot">
-            <button className="btn btn-ghost btn-small" onClick={goHome}>{t("+ Plan another trip")}</button>
+            <p className="hint">{t("Refresh keeps this trip in this tab for up to 6 hours. Download or copy it to keep it longer. Deleting it clears the server copy.")}</p>
+            <button className="btn btn-ghost btn-small" onClick={goHome}>{t("Delete this trip and plan another")}</button>
           </div>
         </main>
       )}

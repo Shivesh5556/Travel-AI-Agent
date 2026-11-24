@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import RouteMap from "./RouteMap.jsx";
 import { ConfidenceChip, WhyLine } from "./Why.jsx";
 import { useI18n, useTranslated } from "../i18n.jsx";
-import { mapsLinkForDay, orderFromHotel, timeAllDays } from "../lib/itinerary.js";
+import { isStopClosedOn, mapsLinkForDay, orderFromHotel, timeAllDays, validateDay, validateMove } from "../lib/itinerary.js";
 
 /*
   The itinerary, drawn as a highway - now with day tabs, clock times, a route
@@ -41,10 +41,11 @@ export default function RoadmapView({ days, from, to, transport, stay, tripId, o
   ]);
   const original = useMemo(() => days.map((d) => d.stops || []), [days]);
 
-  // Edits live only while the trip is on screen - trips are not stored.
+  // Edits remain in memory; refresh restores the original server plan.
   const [stopsByDay, setStopsByDay] = useState(original);
   const [dropped, setDropped] = useState([]);
   const [active, setActive] = useState(0);
+  const [editError, setEditError] = useState("");
 
   const edited = useMemo(
     () => dropped.length > 0 || JSON.stringify(stopsByDay) !== JSON.stringify(original),
@@ -63,52 +64,72 @@ export default function RoadmapView({ days, from, to, transport, stay, tripId, o
 
   if (!days || days.length === 0) return null;
   const dayIdx = Math.min(active, days.length - 1);
-  const day = timed[dayIdx];
-  const link = mapsLinkForDay(day, stay);
+
+  function applyEdit(next, target) {
+    const errors = validateDay({ ...days[target], stops: next[target] }, stay);
+    if (errors.length) { setEditError(errors.join(" ")); return false; }
+    setEditError("");
+    setStopsByDay(next);
+    return true;
+  }
 
   function dropStop(i) {
     const stop = stopsByDay[dayIdx][i];
     setStopsByDay((all) => all.map((s, d) => (d === dayIdx ? s.filter((_, k) => k !== i) : s)));
     setDropped((list) => [...list, { ...stop, fromDay: dayIdx }]);
+    setEditError("");
   }
 
   function restore(k) {
     const stop = dropped[k];
-    setDropped((list) => list.filter((_, i) => i !== k));
-    setStopsByDay((all) =>
-      all.map((s, d) => (d === dayIdx ? orderFromHotel([...s, stop], stay) : s))
-    );
+    const compatibility = validateMove(days[stop.fromDay], { ...days[dayIdx], stops: stopsByDay[dayIdx] }, stop, stay);
+    if (stop.fromDay !== dayIdx && compatibility.length) { setEditError(compatibility.join(" ")); return; }
+    const next = stopsByDay.map((s, d) => d === dayIdx ? orderFromHotel([...s, stop], stay) : s);
+    if (applyEdit(next, dayIdx)) setDropped((list) => list.filter((_, i) => i !== k));
   }
 
   function moveWithin(i, delta) {
-    setStopsByDay((all) =>
-      all.map((s, d) => {
-        if (d !== dayIdx) return s;
-        const j = i + delta;
-        if (j < 0 || j >= s.length) return s;
-        const copy = [...s];
-        [copy[i], copy[j]] = [copy[j], copy[i]];
-        return copy;
-      })
-    );
+    const next = stopsByDay.map((s, d) => {
+      if (d !== dayIdx) return s;
+      const j = i + delta;
+      if (j < 0 || j >= s.length) return s;
+      const copy = [...s];
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+      return copy;
+    });
+    applyEdit(next, dayIdx);
   }
 
   function moveToDay(i, target) {
     if (target === dayIdx) return;
     const stop = stopsByDay[dayIdx][i];
-    setStopsByDay((all) =>
-      all.map((s, d) => {
-        if (d === dayIdx) return s.filter((_, k) => k !== i);
-        if (d === target) return orderFromHotel([...s, stop], stay);
-        return s;
-      })
-    );
+    const compatibility = validateMove({ ...days[dayIdx], stops: stopsByDay[dayIdx] },
+      { ...days[target], stops: stopsByDay[target] }, stop, stay);
+    if (compatibility.length) { setEditError(compatibility.join(" ")); return; }
+    const next = stopsByDay.map((s, d) => {
+      if (d === dayIdx) return s.filter((_, k) => k !== i);
+      if (d === target) return orderFromHotel([...s, stop], stay);
+      return s;
+    });
+    if (applyEdit(next, target)) setActive(target);
+  }
+
+  function tabKeyDown(event, index) {
+    let target;
+    if (event.key === "ArrowRight") target = (index + 1) % timed.length;
+    else if (event.key === "ArrowLeft") target = (index - 1 + timed.length) % timed.length;
+    else if (event.key === "Home") target = 0;
+    else if (event.key === "End") target = timed.length - 1;
+    else return;
+    event.preventDefault();
     setActive(target);
+    document.getElementById(`day-tab-${tripId}-${target}`)?.focus();
   }
 
   function reset() {
     setStopsByDay(original);
     setDropped([]);
+    setEditError("");
   }
 
   return (
@@ -126,7 +147,7 @@ export default function RoadmapView({ days, from, to, transport, stay, tripId, o
       </div>
       <p className="hint lead-hint">
         {t("Stops are grouped by area and ordered from your hotel so you are not crossing the city twice. Drop, reorder or move stops, and the times re-calculate.")}
-        {edited && <strong> {t("Edited view.")}</strong>}
+        {edited && <strong> {t("Edited view. Copy or print to keep your edits; refresh restores the original plan.")}</strong>}
       </p>
 
       <div className="roadsign-row">
@@ -138,11 +159,16 @@ export default function RoadmapView({ days, from, to, transport, stay, tripId, o
         )}
       </div>
 
+      {editError && <div className="error-box" role="alert">{editError}</div>}
       <div className="day-tabs" role="tablist" aria-label="Days">
         {timed.map((d, i) => (
           <button
             key={d.date}
             role="tab"
+            id={`day-tab-${tripId}-${i}`}
+            aria-controls={`day-panel-${tripId}-${i}`}
+            tabIndex={i === dayIdx ? 0 : -1}
+            onKeyDown={(event) => tabKeyDown(event, i)}
             aria-selected={i === dayIdx}
             className={`day-tab ${d.is_rainy ? "rainy" : ""}`}
             onClick={() => setActive(i)}
@@ -156,7 +182,11 @@ export default function RoadmapView({ days, from, to, transport, stay, tripId, o
         ))}
       </div>
 
-      <div className={`day-panel ${day.is_rainy ? "rainy" : ""}`} role="tabpanel">
+      {timed.map((day, panelIdx) => (
+      <div key={day.date} className={`day-panel ${day.is_rainy ? "rainy" : ""} ${panelIdx !== dayIdx ? "inactive-day" : ""}`}
+        role="tabpanel" id={`day-panel-${tripId}-${panelIdx}`} aria-labelledby={`day-tab-${tripId}-${panelIdx}`}
+        tabIndex={panelIdx === dayIdx ? 0 : -1}>
+        <h4 className="print-day-title">{t("Day {n}", { n: day.day_number })} · {niceDate(day.date)}</h4>
         <div className="day-stats">
           <span className="tag">{t("{n} km", { n: day.total_km })}</span>
           <span className="tag">~{day.hours} h</span>
@@ -164,8 +194,8 @@ export default function RoadmapView({ days, from, to, transport, stay, tripId, o
           {day.indoor_share != null && <span className="tag">{t("{n}% indoor", { n: day.indoor_share })}</span>}
           {day.is_rainy && <span className="tag warn">{t("rain likely")}</span>}
           {day.is_wettest && <span className="tag warn">{t("wettest day")}</span>}
-          {link && (
-            <a className="tag link" href={link} target="_blank" rel="noreferrer">
+          {mapsLinkForDay(day, stay) && (
+            <a className="tag link" href={mapsLinkForDay(day, stay)} target="_blank" rel="noreferrer">
               {t("Open route in Google Maps ↗")}
             </a>
           )}
@@ -220,7 +250,7 @@ export default function RoadmapView({ days, from, to, transport, stay, tripId, o
                     <WhyLine why={stop.why} tr={tr} />
                     {stop.recommendation?.cost_note && <p className="hint nm">{t(stop.recommendation.cost_note)}</p>}
                     {!stop.closed_note && closedText(stop.closed_days) && (
-                      <p className="hint nm">{t(closedText(stop.closed_days))} · {t("planned on an open day")}</p>
+                      <p className="hint nm">{t(closedText(stop.closed_days))} · {isStopClosedOn(stop, day.date) ? t("closed on this date — move this stop") : t("planned on an open day")}</p>
                     )}
                     <div className="tl-actions">
                       <button onClick={() => moveWithin(i, -1)} disabled={i === 0} aria-label="Move earlier">▲</button>
@@ -288,6 +318,7 @@ export default function RoadmapView({ days, from, to, transport, stay, tripId, o
           </div>
         )}
       </div>
+      ))}
 
       <div className="roadsign-row">
         {transport && <span className="leg-note">{t("{carrier} back to {from}", { carrier: transport.carrier, from })}</span>}

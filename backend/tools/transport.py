@@ -41,6 +41,24 @@ AVG_SPEED_KMH = {"train": 55, "bus": 42, "flight": 700}
 # Below this distance flying makes no sense once you add airport time.
 MIN_FLIGHT_DISTANCE_KM = 350
 
+# Confirmed rail-served mainland cities. This is connectivity evidence, not a
+# timetable or a claim that a direct service/seat exists on the requested date.
+# Hill towns and unmapped cities retain road estimates instead of fake trains.
+RAIL_CITIES = {
+    "delhi", "new delhi", "mumbai", "bengaluru", "bangalore", "chennai",
+    "kolkata", "hyderabad", "pune", "ahmedabad", "jaipur", "udaipur", "jodhpur",
+    "jaisalmer", "kochi", "alleppey", "thiruvananthapuram", "dehradun",
+    "haridwar", "amritsar", "chandigarh", "agra", "varanasi", "lucknow",
+    "guwahati", "puri", "bhubaneswar", "pondicherry",
+}
+
+
+def _is_island(point: dict) -> bool:
+    """Andaman/Nicobar and Lakshadweep have no mainland road/rail connection."""
+    lat, lon = point["lat"], point["lon"]
+    return ((6 <= lat <= 14.5 and 91 <= lon <= 94.5)
+            or (8 <= lat <= 12.5 and 71 <= lon <= 74))
+
 # Duffel prices each offer in the airline's own currency, NOT in rupees.
 # Its sandbox airline quotes in GBP, so a "168" came out looking like a
 # Rs 168 flight from Pune to Goa - which is obviously wrong and would have
@@ -220,6 +238,9 @@ async def search_ground_transport(origin_city: str, destination_city: str,
     """
     origin = await geo.geocode(origin_city)
     destination = await geo.geocode(destination_city)
+    if _is_island(origin) or _is_island(destination):
+        # Ferries and inter-island services need their own verified provider.
+        return []
     distance = geo.haversine_km(origin["lat"], origin["lon"], destination["lat"], destination["lon"])
 
     # Roads and railway lines are never straight, so add 25% to the crow-flies
@@ -233,6 +254,9 @@ async def search_ground_transport(origin_city: str, destination_city: str,
         ("bus_seater", "bus", "State/private bus (seater)"),
         ("bus_sleeper", "bus", "Private bus (sleeper)"),
     ]:
+        if mode == "train" and not all(city.split(",")[0].strip().casefold() in RAIL_CITIES
+                                       for city in (origin_city, destination_city)):
+            continue
         per_person = int(round(road_distance * FARE_PER_KM[key] / 10) * 10)
         hours = road_distance / AVG_SPEED_KMH[mode]
 
@@ -250,7 +274,10 @@ async def search_ground_transport(origin_city: str, destination_city: str,
             "currency": "INR",
             "distance_km": int(road_distance),
             "price_is_estimate": True,
-            "source": f"estimated from {int(road_distance)}km road/rail distance",
+            "route_is_verified": False,
+            "availability_is_verified": False,
+            "source": (f"estimated from {int(road_distance)}km road/rail distance; "
+                       "route, connections and availability must be checked before travel"),
         })
 
     options.sort(key=lambda o: o["total_inr"])

@@ -20,8 +20,8 @@ from database import Base
 
 
 def new_id() -> str:
-    """Short random id like 'a3f9c1d2e5'. Nicer in a URL than a full UUID."""
-    return uuid.uuid4().hex[:10]
+    """128-bit random identifier; private access still requires a session."""
+    return uuid.uuid4().hex
 
 
 def now() -> datetime:
@@ -31,7 +31,7 @@ def now() -> datetime:
 class Trip(Base):
     __tablename__ = "trips"
 
-    id: Mapped[str] = mapped_column(String(16), primary_key=True, default=new_id)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
 
     # what the user asked for
     source_city: Mapped[str] = mapped_column(String(120))
@@ -71,7 +71,7 @@ class Alert(Base):
     """
     __tablename__ = "alerts"
 
-    id: Mapped[str] = mapped_column(String(16), primary_key=True, default=new_id)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     trip_id: Mapped[str] = mapped_column(ForeignKey("trips.id"))
     kind: Mapped[str] = mapped_column(String(40))       # "weather" / "budget"
     severity: Mapped[str] = mapped_column(String(20), default="info")  # info / warning

@@ -287,8 +287,7 @@ async def understand(notes: str, children: int = 0, trip_id: str | None = None) 
 
 
 def filter_transport(options: list[dict], prefs: dict) -> tuple[list[dict], str]:
-    """Drop modes / departure times the traveller ruled out. If that would leave
-    nothing, keep everything and say so honestly."""
+    """Keep explicit mode and departure constraints even when none can fit."""
     if not options:
         return options, ""
     kept = [o for o in options if o.get("mode") not in set(prefs.get("avoid_modes") or [])]
@@ -301,9 +300,10 @@ def filter_transport(options: list[dict], prefs: dict) -> tuple[list[dict], str]
                 h, m = str(o.get("depart") or "").split(":")[:2]
                 return int(h) + int(m) / 60.0 >= before
             except ValueError:
-                return True
+                # An unconfirmed time cannot satisfy a minimum departure time.
+                return False
         kept = [o for o in kept if ok(o)]
     if not kept:
-        return options, ("Nothing matched your travel preferences, so every option was "
-                         "considered.")
+        return [], ("No available transport option satisfies your travel preferences. "
+                    "Try different dates or relax the transport constraint.")
     return kept, ""

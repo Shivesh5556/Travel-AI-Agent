@@ -6,7 +6,8 @@ or a backwards date range gets rejected before our code even runs) and to
 build the docs at http://127.0.0.1:8000/docs.
 """
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from typing import Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
@@ -23,6 +24,29 @@ INTEREST_CHOICES = [
 #   comfort   spend the money. Flights and a decent hotel; only drop down
 #             if the budget genuinely will not stretch.
 TRAVEL_STYLES = ["budget", "balanced", "comfort"]
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+class CityLocation(BaseModel):
+    """The exact Indian city selected in autocomplete, rather than a name guess."""
+
+    id: str = Field(min_length=1, max_length=240)
+    name: str = Field(min_length=2, max_length=120)
+    lat: float = Field(ge=6, le=37.5, allow_inf_nan=False)
+    lon: float = Field(ge=68, le=98.5, allow_inf_nan=False)
+    state: str = Field(default="", max_length=120)
+    country_code: Literal["in"] = "in"
+    iata: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+
+    @field_validator("country_code", mode="before")
+    @classmethod
+    def india_only(cls, value):
+        return str(value).strip().lower()
+
+    @field_validator("iata", mode="before")
+    @classmethod
+    def airport_code(cls, value):
+        return str(value).strip().upper() if value else None
 
 
 class TripRequest(BaseModel):
@@ -30,6 +54,8 @@ class TripRequest(BaseModel):
 
     source_city: str = Field(min_length=2, max_length=120, examples=["Dehradun"])
     destination_city: str = Field(min_length=2, max_length=120, examples=["Jaipur"])
+    source_location: CityLocation | None = None
+    destination_location: CityLocation | None = None
     start_date: date
     end_date: date
     travelers: int = Field(ge=1, le=20, default=2)
@@ -54,7 +80,10 @@ class TripRequest(BaseModel):
     @field_validator("source_city", "destination_city")
     @classmethod
     def clean_city(cls, v: str) -> str:
-        return v.strip().title()
+        cleaned = v.strip().title()
+        if len(cleaned) < 2:
+            raise ValueError("City names must contain at least two characters")
+        return cleaned
 
     @model_validator(mode="after")
     def check_dates(self):
@@ -62,15 +91,33 @@ class TripRequest(BaseModel):
             self.travelers = self.adults + self.children
             if self.travelers > 20:
                 raise ValueError("At most 20 travellers")
-        if self.start_date < date.today() - timedelta(days=1):
-            # (one day of slack for time zones: it may still be "yesterday" for the server)
+        elif self.children >= self.travelers:
+            raise ValueError("The group must include at least one adult")
+        if self.start_date < datetime.now(IST).date():
             raise ValueError("The trip cannot start in the past")
         if self.end_date < self.start_date:
             raise ValueError("end_date cannot be before start_date")
         if (self.end_date - self.start_date).days > 21:
             raise ValueError("Trips longer than 21 days are not supported yet")
-        if self.source_city.lower() == self.destination_city.lower():
-            raise ValueError("Source and destination are the same city")
+        for city, location in ((self.source_city, self.source_location),
+                               (self.destination_city, self.destination_location)):
+            if location and location.name.strip().casefold() != city.split(",")[0].strip().casefold():
+                raise ValueError("Selected location does not match the city name; select the city again")
+        if self.source_location and self.destination_location:
+            if (abs(self.source_location.lat - self.destination_location.lat) < 0.001
+                    and abs(self.source_location.lon - self.destination_location.lon) < 0.001):
+                raise ValueError("Source and destination are the same place")
+        if self.source_city.casefold() == self.destination_city.casefold():
+            if not (self.source_location and self.destination_location):
+                raise ValueError("Source and destination are the same city")
+            def label(location):
+                detail = location.state or f"{location.lat:.5f}, {location.lon:.5f}"
+                return f"{location.name}, {detail}"
+            self.source_city = label(self.source_location)
+            self.destination_city = label(self.destination_location)
+            if self.source_city == self.destination_city:
+                self.source_city += f" ({self.source_location.lat:.5f}, {self.source_location.lon:.5f})"
+                self.destination_city += f" ({self.destination_location.lat:.5f}, {self.destination_location.lon:.5f})"
         return self
 
     @property

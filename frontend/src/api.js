@@ -6,32 +6,42 @@
   development. See vite.config.js.
 */
 
-/*
-  An anonymous id for this browser, so only the browser that planned a trip
-  can delete it. Not a login.
-*/
-function clientId() {
-  const KEY = "gg-client-id";
-  try {
-    let id = localStorage.getItem(KEY);
-    if (!id) {
-      id = (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`)
-        .replace(/[^a-zA-Z0-9-]/g, "");
-      localStorage.setItem(KEY, id);
-    }
-    return id;
-  } catch {
-    // storage blocked (private mode): a per-tab id still keeps trips separate
-    if (!window.__ggClientId) window.__ggClientId = `tab-${Date.now()}`;
-    return window.__ggClientId;
+// A server-issued HttpOnly cookie identifies this browser. JavaScript never
+// stores or reads the credential. Share startup work across concurrent calls.
+let sessionPromise = null;
+
+export function ensureSession() {
+  if (!sessionPromise) {
+    sessionPromise = fetch("/api/session", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+    }).then((response) => {
+      if (!response.ok) throw new Error("Could not start a secure session. Please retry.");
+    }).catch((error) => {
+      sessionPromise = null;
+      throw error;
+    });
   }
+  return sessionPromise;
 }
 
 async function request(path, options = {}) {
-  const response = await fetch(path, {
+  await ensureSession();
+  const activeSession = sessionPromise;
+  const fetchOptions = {
     ...options,
-    headers: { "Content-Type": "application/json", "X-Client-Id": clientId(), ...(options.headers || {}) },
-  });
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+  };
+  let response = await fetch(path, fetchOptions);
+  if (response.status === 401) {
+    // A tab may outlive its six-hour cookie. Renew once, sharing concurrent
+    // renewals; expired trips still return the server's normal not-found error.
+    if (sessionPromise === activeSession) sessionPromise = null;
+    await ensureSession();
+    response = await fetch(path, fetchOptions);
+  }
 
   if (!response.ok) {
     // FastAPI puts the reason in "detail". For validation errors that is a
@@ -62,8 +72,12 @@ export const api = {
     request("/api/translate", { method: "POST", body: JSON.stringify({ lang, texts }) }),
   searchCities: (q) => request(`/api/geo/search?q=${encodeURIComponent(q)}`),
 
-  createTrip: (body) =>
-    request("/api/trips", { method: "POST", body: JSON.stringify(body) }),
+  createTrip: (body, idempotencyKey) =>
+    request("/api/trips", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(body),
+    }),
   getTrip: (id) => request(`/api/trips/${id}`),
   deleteTrip: (id) => request(`/api/trips/${id}`, { method: "DELETE" }),
 
@@ -120,52 +134,33 @@ export function loadRazorpay() {
   Returns a close function so the component can clean up on unmount.
 */
 export function streamTrip(tripId, onEvent, onDone) {
-  const source = new EventSource(`/api/trips/${tripId}/stream`);
-
-  source.onmessage = (message) => {
-    const event = JSON.parse(message.data);
-    if (event.step === "__end__") {
-      source.close();
-      onDone();
-      return;
-    }
-    onEvent(event);
-  };
-
-  // v24: a dropped connection is not "finished". EventSource reconnects by
-  // itself (the server replays what was missed and the app drops duplicates
-  // by seq). Only after several failures in a row do we stop and hand over to
-  // the caller, which then polls the trip until it is done.
-  let failures = 0;
-  source.onopen = () => {
-    failures = 0;
-  };
-  source.onerror = () => {
-    failures += 1;
-    if (source.readyState === EventSource.CLOSED || failures >= 5) {
-      source.close();
-      onDone();
-    }
-  };
-
-  return () => source.close();
-}
-
-/*
-  Trips are viewed once and then forgotten. This runs when you plan another
-  trip or leave the page. `keepalive` lets the request finish even while the
-  tab is closing; errors are ignored (the server also clears old trips itself).
-*/
-export function forgetTrip(id) {
-  try {
-    fetch(`/api/trips/${id}`, {
-      method: "DELETE",
-      keepalive: true,
-      headers: { "X-Client-Id": clientId() },
-    }).catch(() => {});
-  } catch {
-    /* nothing to do */
-  }
+  let source = null;
+  let cancelled = false;
+  ensureSession().then(() => {
+    if (cancelled) return;
+    source = new EventSource(`/api/trips/${tripId}/stream`);
+    source.onmessage = (message) => {
+      let event;
+      try { event = JSON.parse(message.data); }
+      catch { return; }
+      if (event.step === "__end__") {
+        source.close();
+        onDone();
+        return;
+      }
+      onEvent(event);
+    };
+    let failures = 0;
+    source.onopen = () => { failures = 0; };
+    source.onerror = () => {
+      failures += 1;
+      if (source.readyState === EventSource.CLOSED || failures >= 5) {
+        source.close();
+        onDone();
+      }
+    };
+  }).catch(() => { if (!cancelled) onDone(); });
+  return () => { cancelled = true; source?.close(); };
 }
 
 export function rupees(amount) {

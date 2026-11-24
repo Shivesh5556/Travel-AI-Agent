@@ -24,7 +24,7 @@ if config.REDIS_URL:
         import redis.asyncio as redis_lib
 
         _redis = redis_lib.from_url(config.REDIS_URL, decode_responses=True)
-        print("[cache] using Redis at", config.REDIS_URL)
+        print("[cache] using Redis")
     except Exception as e:  # pragma: no cover - only happens on a bad setup
         print("[cache] Redis not available, falling back to memory:", e)
         _redis = None

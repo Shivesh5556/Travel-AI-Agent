@@ -523,6 +523,11 @@ def score_attraction(place: dict, interests: list[str], votes: dict[str, int] | 
     wanted_by_name = any(_normalize(m) and _normalize(m) in _normalize(name)
                          for m in (ctx.get("must_include") or ()))
 
+    # Editorial quality never overrides an explicit traveller exclusion. A
+    # named request is the sole intentional exception ("no temples except X").
+    if not wanted_by_name and _blocked_by_preferences(place, ctx):
+        return None
+
     strongly_documented = bool(place.get("wikidata") or place.get("wikipedia")
                                or place.get("heritage") or place.get("source") == "wikipedia")
     if not curated and not wanted_by_name:
@@ -533,8 +538,6 @@ def score_attraction(place: dict, interests: list[str], votes: dict[str, int] | 
             return None
         if is_soft_negative(name, city) and not notable and not names_a_sight(name) \
                 and not _is_famous_market(name):
-            return None
-        if _blocked_by_preferences(place, ctx):
             return None
 
     kind = _kind(place)

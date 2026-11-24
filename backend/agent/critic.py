@@ -18,7 +18,12 @@ Layer 1 exists because you should never depend on an LLM to catch your bugs.
 Layer 2 exists because rules cannot think.
 """
 
+import math
+
+import dayplanner
 import llm
+import recommend
+from tools import city_prices
 from tools.geo import haversine_km
 
 # Places where altitude is a genuine health issue, not a nice view.
@@ -28,6 +33,77 @@ HIGH_ALTITUDE = {"leh", "spiti", "khardung", "tso moriri", "nubra", "kaza"}
 MAX_COMFORTABLE_KM_PER_DAY = 45
 MAX_COMFORTABLE_HOURS = 8.5
 MAX_HOTEL_DISTANCE_KM = 25
+
+
+def validate_plan(plan: dict, prefs: dict | None = None) -> list[dict]:
+    """Final hard-contract checks, independent of the language reviewer.
+
+    These are correctness failures, not comfort suggestions. Callers should
+    withhold a successful itinerary while any violation remains unresolved.
+    """
+    prefs = prefs if prefs is not None else plan.get("preferences") or {}
+    violations = []
+
+    def add(kind, issue, day=None):
+        violations.append({"kind": kind, "severity": "error", "day": day,
+                           "issue": issue, "fix": "Rebuild the affected part of this plan."})
+
+    cap = prefs.get("max_stops_per_day") or dayplanner.DEFAULT_MAX_STOPS
+    seen = set()
+    stay = plan.get("stay")
+    destination = plan.get("destination") or {}
+    base = stay or destination
+    located_base = base.get("lat") is not None and base.get("lon") is not None
+    for day in plan.get("days", []):
+        number = day.get("day_number")
+        stops = day.get("stops") or []
+        if len(stops) > cap:
+            add("stop_limit", f"Day {number} exceeds the requested limit of {cap} stops.", number)
+        if dayplanner._weekday(day.get("date")) is None:
+            add("invalid_date", f"Day {number} has an invalid calendar date.", number)
+        for stop in stops:
+            name = stop.get("name", "Unnamed place")
+            key = name.strip().casefold()
+            if key in seen:
+                add("duplicate_stop", f"{name} is scheduled more than once.", number)
+            seen.add(key)
+            if not dayplanner.available_on(stop, day.get("date")):
+                add("unavailable_stop", f"{name} cannot be visited on {day.get('date')}.", number)
+            named = any(recommend._normalize(n) and recommend._normalize(n) in
+                        recommend._normalize(name) for n in prefs.get("must_include", []))
+            if not named and recommend._blocked_by_preferences(stop, prefs):
+                add("excluded_stop", f"{name} conflicts with the traveller's exclusions.", number)
+            coords = (stop.get("lat"), stop.get("lon"))
+            if not all(isinstance(v, (float, int)) and math.isfinite(v) for v in coords) or \
+                    not (-90 <= coords[0] <= 90 and -180 <= coords[1] <= 180):
+                add("invalid_coordinates", f"{name} has invalid coordinates.", number)
+        available = day.get("available_hours", dayplanner.MAX_HOURS_PER_DAY)
+        hours = day.get("elapsed_hours", day.get("hours", 0))
+        if located_base and stops and not any(v["kind"] == "invalid_coordinates" and
+                                              v["day"] == number for v in violations):
+            ordered = dayplanner.order_for_the_day(stops, base["lat"], base["lon"])
+            hours = dayplanner.day_elapsed_hours(
+                ordered, base["lat"], base["lon"], day.get("start_hour", dayplanner.DAY_START_HOUR),
+                bool(day.get("lunch")))
+        if hours > available:
+            add("day_capacity", f"Day {number} needs {hours:g} hours but only {available:g} are available.", number)
+
+    budget = plan.get("budget")
+    if budget:
+        lines = budget.get("lines") or []
+        amounts = [line.get("amount_inr", 0) for line in lines]
+        if (sum(amounts) != budget.get("total_inr") or
+                sum(amounts[:-1]) != budget.get("subtotal_inr") or
+                budget.get("total_inr") != budget.get("subtotal_inr", 0) + budget.get("buffer_inr", 0)):
+            add("budget_inconsistent", "The budget line items do not match the displayed total.")
+        ride = plan.get("transport")
+        if ride and lines and "return_total_inr" in ride and \
+                lines[0].get("amount_inr") != ride["return_total_inr"]:
+            add("budget_inconsistent", "The selected transport price does not match the budget.")
+        fits = budget.get("total_inr", 0) <= budget.get("budget_inr", 0)
+        if bool(budget.get("fits")) != fits or bool(plan.get("fits", fits)) != fits:
+            add("budget_inconsistent", "The budget fit status does not match the computed total.")
+    return violations
 
 
 def rule_checks(plan: dict, trip_text: str, destination: str) -> list[dict]:
@@ -167,7 +243,7 @@ def rule_checks(plan: dict, trip_text: str, destination: str) -> list[dict]:
         })
 
     # --- altitude ---
-    if destination.strip().lower() in HIGH_ALTITUDE and len(days) < 4:
+    if city_prices.normalise_city(destination) in HIGH_ALTITUDE and len(days) < 4:
         issues.append({
             "severity": "warning",
             "kind": "altitude", "for_traveller": True,

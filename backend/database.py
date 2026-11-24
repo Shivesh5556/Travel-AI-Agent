@@ -34,7 +34,7 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_add_missing_columns)
-    print("[db] tables ready ->", config.DATABASE_URL)
+    print("[db] tables ready ->", engine.url.render_as_string(hide_password=True))
 
 
 async def get_session():
@@ -57,3 +57,11 @@ def _add_missing_columns(sync_conn):
     if "owner_id" not in have:
         sync_conn.execute(text("ALTER TABLE trips ADD COLUMN owner_id VARCHAR(64)"))
         print("[db] added trips.owner_id")
+    # SQLite does not enforce VARCHAR widths. PostgreSQL needs the explicit
+    # widening so existing deployments accept the full UUID identifiers.
+    if sync_conn.dialect.name == "postgresql":
+        for table, column in (("trips", "id"), ("alerts", "id"), ("alerts", "trip_id")):
+            columns = {c["name"]: c["type"] for c in inspector.get_columns(table)}
+            if getattr(columns.get(column), "length", 32) < 32:
+                sync_conn.execute(text(
+                    f"ALTER TABLE {table} ALTER COLUMN {column} TYPE VARCHAR(32)"))

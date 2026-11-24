@@ -1,3 +1,4 @@
+import { useId } from "react";
 import { projectPoints } from "../lib/itinerary.js";
 
 /*
@@ -10,6 +11,7 @@ import { projectPoints } from "../lib/itinerary.js";
   Google Maps.
 */
 export default function RouteMap({ stay, stops, lunch }) {
+  const gridId = `route-grid-${useId().replace(/:/g, "")}`;
   const W = 440;
   const H = 320;
   const points = [];
@@ -35,11 +37,11 @@ export default function RouteMap({ stay, stops, lunch }) {
     <div className="routemap">
       <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label="Schematic route for the day">
         <defs>
-          <pattern id="rm-grid" width="40" height="40" patternUnits="userSpaceOnUse">
+          <pattern id={gridId} width="40" height="40" patternUnits="userSpaceOnUse">
             <path d="M 40 0 L 0 0 0 40" fill="none" stroke="var(--line-soft)" strokeWidth="1" />
           </pattern>
         </defs>
-        <rect width={W} height={H} fill="url(#rm-grid)" />
+        <rect width={W} height={H} fill={`url(#${gridId})`} />
         <polyline points={path} fill="none" stroke="var(--asphalt)" strokeWidth="9" strokeLinecap="round" strokeLinejoin="round" opacity="0.92" />
         <polyline points={path} fill="none" stroke="var(--stone)" strokeWidth="2" strokeDasharray="6 7" strokeLinecap="round" strokeLinejoin="round" />
         {lunchPt && (

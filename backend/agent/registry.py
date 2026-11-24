@@ -127,6 +127,7 @@ TOOL_SCHEMAS = [
                     "travelers": {"type": "integer"},
                     "budget_inr": {"type": "integer"},
                     "style": {"type": "string", "enum": ["shoestring", "normal", "comfort"]},
+                    "city": {"type": "string", "description": "Destination city, so daily costs match local prices"},
                 },
                 "required": ["travel_total_inr", "stay_total_inr", "days", "travelers", "budget_inr"],
             },
@@ -194,6 +195,7 @@ async def run_tool(name: str, args: dict, extra: dict | None = None) -> dict:
                 travelers=args["travelers"],
                 budget_inr=args["budget_inr"],
                 style=args.get("style", "normal"),
+                city=args.get("city"),
             )
             return {"ok": True, "result": result}
 

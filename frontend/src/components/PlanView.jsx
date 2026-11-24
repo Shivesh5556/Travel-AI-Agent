@@ -75,6 +75,7 @@ export default function PlanView({ trip, paymentsOn, onCheckout, onRefreshAlerts
     ...(plan.stay_options || []).map((x) => x.why),
     ...(plan.preferences?.understood || []),
     ...(plan.transport_note ? [plan.transport_note] : []),
+    ...(plan.transport?.return_fare_note ? [plan.transport.return_fare_note] : []),
     ...(plan.stay_stretch?.stay?.why ? [plan.stay_stretch.stay.why] : []),
   ].filter(Boolean));
 
@@ -86,8 +87,8 @@ export default function PlanView({ trip, paymentsOn, onCheckout, onRefreshAlerts
         <div className="error-box">{tr(plan.reason)}</div>
         {plan.minimum_needed_inr > 0 && (
           <p className="hint">
-            The bare minimum for {trip.travelers} people over these dates is about {money(plan.minimum_needed_inr)}, before
-            you get there or sleep anywhere. Try a longer budget, fewer days or a closer destination.
+            The lowest estimate found for {trip.travelers} people over these dates is about {money(plan.minimum_needed_inr)}.
+            Try a higher budget, fewer days or a closer destination. Confirm current prices before booking.
           </p>
         )}
         {plan.attempts && plan.attempts.length > 0 && (
@@ -236,6 +237,7 @@ export default function PlanView({ trip, paymentsOn, onCheckout, onRefreshAlerts
                     {" · "}
                     {t("{x} each way for everyone", { x: money(transport.one_way_total_inr ?? transport.total_inr) })}
                   </p>
+                  {transport.return_fare_note && <p className="hint nm">{tr(transport.return_fare_note)}</p>}
                   <p className="hint nm">{t("Source:")} {transport.source}</p>
                 </div>
               </div>
@@ -304,6 +306,7 @@ export default function PlanView({ trip, paymentsOn, onCheckout, onRefreshAlerts
                   <span className="wx-i" aria-hidden="true">{WEATHER_ICON(day.description, day.rain_chance)}</span>
                   <span className="wx-t num">{day.low_c}–{day.high_c}°C</span>
                   <span className="wx-s">{tr(day.description)}</span>
+                  {typeof day.is_real_forecast === "boolean" && <span className="tag">{day.is_real_forecast ? t("Forecast") : t("Climate estimate")}</span>}
                   {day.rain_chance != null && <span className="wx-r num">{t("{n}% rain", { n: day.rain_chance })}</span>}
                 </div>
               ))}
@@ -345,7 +348,7 @@ export default function PlanView({ trip, paymentsOn, onCheckout, onRefreshAlerts
       <aside className="plan-rail">
         {budget && (
           <div className={`rail-card verdict-mini ${budget.fits ? "fits" : "over"}`}>
-            <span className="label">{budget.fits ? t("Fits your budget") : t("Over budget")}</span>
+            <span className="label">{budget.fits ? t("Estimated to fit your budget") : t("Estimated over budget")}</span>
             <div className="big num">{money(budget.total_inr)}</div>
             <div className="sub num">
               {budget.fits ? t("{x} left over", { x: money(budget.left_over_inr) }) : t("{x} short", { x: money(budget.over_by_inr) })} · {t("{x} / person", { x: money(budget.per_person_inr) })}

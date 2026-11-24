@@ -672,3 +672,13 @@ textarea { resize: vertical; }
 .prefs-card { margin-bottom: var(--s4); }
 .prefs-card ul { margin: var(--s2) 0 0; padding-left: 1.1rem; }
 .prefs-card li { margin: 2px 0; }
+
+/* Day tabs show one panel on screen; every edited day is present for export. */
+.city-suggestion.active { background: var(--stone-soft); }
+.inactive-day, .print-day-title { display: none; }
+@media print {
+  .inactive-day, .print-day-title { display: block !important; }
+  #itinerary, .day-panel { break-inside: auto; }
+  .day-panel { margin: 16px 0; }
+  .tl-item { break-inside: avoid; }
+}

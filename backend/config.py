@@ -5,8 +5,8 @@ Everything is read from the .env file.
 
 STRICT MODE (the default)
     The app refuses to plan a trip unless it has a real Groq key, a real
-    Duffel key, AND all three places/events upgrade keys (Geoapify,
-    Ticketmaster, Foursquare). That is deliberate: this build is tuned to
+    Duffel key, and a Geoapify key. Ticketmaster and Foursquare remain
+    optional. This build is tuned to
     pull the best possible result out of every source it can reach and pick
     the cheapest combination that fits the budget, rather than quietly
     planning off a smaller pool of places because one source was left out.
@@ -16,7 +16,7 @@ STRICT MODE (the default)
 
     Set STRICT_MODE=false in .env if you want to run without keys (the test
     suite does this, so tests never need a live API key). With STRICT_MODE
-    off, any of these six keys can still be left blank - the app just uses
+    off, provider keys can be left blank - the app just uses
     fewer sources for that piece of the plan.
 """
 
@@ -164,6 +164,13 @@ def is_ready() -> bool:
 RAZORPAY_KEY_ID = _get("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = _get("RAZORPAY_KEY_SECRET")
 PAYMENTS_ENABLED = bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET)
+PAYMENTS_TEST_MODE = RAZORPAY_KEY_ID.startswith("rzp_test_")
+
+
+def validate_payment_config() -> None:
+    """This demo must never open a live payment checkout."""
+    if RAZORPAY_KEY_ID and not RAZORPAY_KEY_ID.startswith("rzp_test_"):
+        raise ValueError("Only Razorpay test keys (rzp_test_) are allowed in this demo")
 
 
 # ---------- Database ----------
@@ -232,6 +239,12 @@ MAX_AGENT_STEPS = int(_get("MAX_AGENT_STEPS", "12"))
 # Abuse protection for a public deployment. Every plan costs LLM tokens, so
 # one browser / IP may only start this many plans per hour.
 MAX_TRIPS_PER_HOUR = int(_get("MAX_TRIPS_PER_HOUR", "20"))
+MAX_CONCURRENT_PLANS = max(1, int(_get("MAX_CONCURRENT_PLANS", "4")))
+MAX_TRANSLATIONS_PER_HOUR = max(1, int(_get("MAX_TRANSLATIONS_PER_HOUR", "60")))
+MAX_MONITOR_RUNS_PER_HOUR = max(1, int(_get("MAX_MONITOR_RUNS_PER_HOUR", "30")))
+MAX_TRANSLATION_CHARS = max(1, int(_get("MAX_TRANSLATION_CHARS", "30000")))
+SESSION_COOKIE_SECURE = _get_bool("SESSION_COOKIE_SECURE", False)
+SESSION_COOKIE_MAX_AGE = max(60, int(_get("SESSION_COOKIE_MAX_AGE", "604800")))
 
 # Trips are view-once: the browser deletes its trip when you leave it, and
 # anything older than this many hours is removed by the background task.

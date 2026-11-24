@@ -401,12 +401,15 @@ def day_windows(num_days: int, transport: dict | None) -> list[dict]:
     else:
         arrive = 20.0 + hours - 24.0          # overnight, left the evening before
         how = f"Overnight {mode}: leave around 8 PM the evening before"
-    first = windows[0]
-    if arrive >= 24:
-        first["start_hour"], first["available_hours"] = DAY_END_HOUR, 0.0
-        first["travel_note"] = (f"{how}; the journey takes about {transport.get('duration')}, "
-                                f"so Day 1 is a travel day (estimate).")
-    else:
+    arrival_day = max(0, int(arrive // 24))
+    for i in range(min(arrival_day, num_days)):
+        windows[i]["start_hour"], windows[i]["available_hours"] = DAY_END_HOUR, 0.0
+        windows[i]["travel_note"] = (
+            f"{how}; the journey takes about {transport.get('duration')}, "
+            f"so Day {i + 1} is a travel day (estimate).")
+    if arrival_day < num_days:
+        first = windows[arrival_day]
+        arrive %= 24
         start = max(DAY_START_HOUR, arrive + 1.0)
         first["start_hour"] = round(start, 2)
         first["available_hours"] = round(max(0.0, min(MAX_HOURS_PER_DAY, DAY_END_HOUR - start)), 1)
@@ -465,6 +468,11 @@ def _closed_on(place: dict, iso: str) -> bool:
     return wd is not None and wd in (place.get("closed_days") or ())
 
 
+def available_on(place: dict, iso: str) -> bool:
+    """One eligibility rule shared by assignment, borrowing and repairs."""
+    return not _closed_on(place, iso) and (not place.get("only_on") or place["only_on"] == iso)
+
+
 def _pick_best_for_day(cluster: list[dict], budget: float = DAY_VISIT_CAPACITY,
                        max_stops: int | None = None) -> tuple[list[dict], list[dict]]:
     """
@@ -475,7 +483,7 @@ def _pick_best_for_day(cluster: list[dict], budget: float = DAY_VISIT_CAPACITY,
     chosen, left_out, used = [], [], 0.0
     for place in sorted(cluster, key=lambda p: p.get("score", 0), reverse=True):
         hours = place.get("visit_hours", 1.5)
-        fits_time = (not chosen and hours <= budget + 1.0) or used + hours <= budget
+        fits_time = used + hours <= budget
         fits_count = max_stops is None or len(chosen) < max_stops
         if fits_time and fits_count and budget > 0:
             chosen.append(place)
@@ -499,7 +507,7 @@ def trim_to_day_length(stops: list[dict], max_hours: float = MAX_HOURS_PER_DAY) 
         # assume 20 km/h average in an Indian city, traffic included
         travel = stop.get("leg_km", 0) / 20.0
 
-        if hours_used + visit + travel <= max_hours or (not kept and max_hours >= 1.0):
+        if hours_used + visit + travel <= max_hours:
             kept.append(stop)
             hours_used += visit + travel
         else:
@@ -565,7 +573,7 @@ def _assignment_cost(cluster: list[dict], date_iso: str, capacity: float, is_rai
     if short_day and far > DAY_TRIP_KM:
         cost += 40.0 + 4.0 * drive_hours(far, base, cluster)
     for p in cluster:
-        if _closed_on(p, date_iso):
+        if not available_on(p, date_iso):
             cost += 100.0 + p.get("score", 50)
     over = _hours(cluster) - capacity
     if over > 0:
@@ -618,11 +626,11 @@ def _fix_closed_days(assigned: list[list[dict]], dates: list[str], capacities: l
     Returns human-readable notes about what moved / could not be placed."""
     notes = []
     for d, cluster in enumerate(assigned):
-        for p in [p for p in cluster if _closed_on(p, dates[d])]:
+        for p in [p for p in cluster if not available_on(p, dates[d])]:
             closed_name = WEEKDAY_NAMES[_weekday(dates[d])]
             options = []
             for j, other in enumerate(assigned):
-                if j == d or _closed_on(p, dates[j]) or capacities[j] < 1.0:
+                if j == d or not available_on(p, dates[j]) or capacities[j] < 1.0:
                     continue
                 if _hours(other) + p.get("visit_hours", 1.5) > max(capacities[j] - 0.5, 1.0):
                     continue
@@ -683,7 +691,7 @@ def even_out(assigned: list[list[dict]], dates: list[str], capacities: list[floa
         best = None
         for p in assigned[hi]:
             h = p.get("visit_hours", 1.5)
-            if p.get("only_on") or _closed_on(p, dates[lo]):
+            if p.get("only_on") or not available_on(p, dates[lo]):
                 continue
             if _hours(assigned[lo]) + h > capacities[lo] or len(assigned[lo]) >= max_stops:
                 continue
@@ -720,7 +728,7 @@ def fill_light_days(assigned: list[list[dict]], reserve: list[dict], dates: list
         floor = min(capacities[i], MIN_DAY_HOURS)
         while _hours(assigned[i]) < floor and len(assigned[i]) < max_stops and reserve:
             centre = _centre(assigned[i])
-            options = [p for p in reserve if not _closed_on(p, dates[i])
+            options = [p for p in reserve if available_on(p, dates[i])
                        and _hours(assigned[i]) + p.get("visit_hours", 1.5) <= capacities[i] + 0.5
                        and (centre is None or haversine_km(p["lat"], p["lon"], centre[0],
                                                            centre[1]) <= MAX_MOVE_KM)
@@ -744,9 +752,9 @@ def level_stop_counts(day_stops: list[list[dict]], dates: list[str], avail: list
                       pool: list[dict], hotel: tuple[float, float],
                       max_stops: int = DEFAULT_MAX_STOPS, max_rounds: int = 120) -> set[int]:
     """
-    Make every sightseeing day have the SAME number of activities (at most one
-    apart when the total does not divide evenly). In place; returns the days
-    that changed.
+    Balance activity counts where dates, duration and geography permit.
+    In place; returns the days that changed. Valid visits are never deleted
+    solely to make different days have equal counts.
 
     Each round looks at the day with the fewest stops and the day with the
     most, and tries, in order:
@@ -754,8 +762,7 @@ def level_stop_counts(day_stops: list[list[dict]], dates: list[str], avail: list
          kind of day - never a city temple on the Mussoorie outing - and the
          day still fits its hours, drive included)
       2. move a stop from the busy day to the light day (same rules)
-      3. drop the busy day's weakest stop (it becomes an "if you have time" idea)
-    Step 3 always shrinks the gap, so this always finishes.
+    If neither addition nor transfer is possible, retain the different counts.
     """
     idx = [i for i in range(len(day_stops)) if avail[i] >= LEVEL_MIN_HOURS]
     changed: set[int] = set()
@@ -765,10 +772,10 @@ def level_stop_counts(day_stops: list[list[dict]], dates: list[str], avail: list
 
     def fits(i: int, stops: list[dict]) -> bool:
         ordered = order_for_the_day(stops, *hotel)
-        return day_metrics(ordered, *hotel)["hours"] <= avail[i] + 0.5
+        return day_metrics(ordered, *hotel)["hours"] <= avail[i]
 
     def suitable(p: dict, i: int) -> bool:
-        if _closed_on(p, dates[i]) or p.get("only_on") and p["only_on"] != dates[i]:
+        if not available_on(p, dates[i]):
             return False
         centre = _centre(day_stops[i]) or hotel
         if haversine_km(p["lat"], p["lon"], centre[0], centre[1]) > MAX_MOVE_KM:
@@ -811,13 +818,9 @@ def level_stop_counts(day_stops: list[list[dict]], dates: list[str], avail: list
                        key=lambda i: (counts[i], _hours(day_stops[i])))
         if any(try_raise(lo, counts) for lo in light):
             continue
-        # 3. nothing can be added anywhere: trim the busiest day's weakest stop
-        hi = max(idx, key=lambda i: (counts[i], _hours(day_stops[i])))
-        weakest = min(day_stops[hi], key=lambda p: (bool(p.get("must_see")), p.get("score", 0)))
-        day_stops[hi].remove(weakest)
-        pool.insert(0, weakest)
-        used.discard(weakest["name"])
-        changed.add(hi)
+        # Unequal counts are valid when geography, opening dates or duration
+        # prevent a move. Never delete a good visit just to make counts match.
+        break
 
     # 4. top up: the counts are now within one, but a city with 12 good places
     #    should not end up with 1-2 stops a day while places sit unused. Give the
@@ -827,7 +830,7 @@ def level_stop_counts(day_stops: list[list[dict]], dates: list[str], avail: list
     def comfy(i: int, stops: list[dict]) -> bool:
         limit = min(avail[i], COMFORTABLE_DAY_HOURS)
         ordered = order_for_the_day(stops, *hotel)
-        return day_metrics(ordered, *hotel)["hours"] <= limit + 0.5
+        return day_metrics(ordered, *hotel)["hours"] <= limit
 
     for _ in range(max_rounds):
         counts = {i: len(day_stops[i]) for i in idx}
@@ -895,10 +898,11 @@ def build_day_plan(attractions: list[dict], restaurants: list[dict], dates: list
     def _empty_day(i, d):
         w = windows[i]
         return {"date": d, "day_number": i + 1, "stops": [], "lunch": None,
-                "total_km": 0, "hours": 0, "is_rainy": d in rainy_dates,
+                "total_km": 0, "hours": 0, "elapsed_hours": 0, "is_rainy": d in rainy_dates,
                 "rain_chance": rain_chances.get(d), "is_wettest": d == wettest,
                 "indoor_share": 0, "extra_ideas": [], "start_hour": w["start_hour"],
                 "available_hours": w["available_hours"], "travel_note": w["travel_note"],
+                "max_stops_per_day": max_stops_per_day or DEFAULT_MAX_STOPS,
                 "travel_day": w["available_hours"] < 1.0, "notes": []}
 
     if not attractions:
@@ -970,11 +974,11 @@ def build_day_plan(attractions: list[dict], restaurants: list[dict], dates: list
         far = trip_distance(assigned[i], (hotel_lat, hotel_lon))
         drive_back = (drive_hours(far, (hotel_lat, hotel_lon), assigned[i])
                       if far > DAY_TRIP_KM else 0.0)
-        visit_budget = max(1.0, capacities[i] - 2 * drive_back) if drive_back else capacities[i]
+        visit_budget = max(0.0, capacities[i] - 2 * drive_back) if drive_back else capacities[i]
         chosen, left_out = _pick_best_for_day(assigned[i], visit_budget, max_stops)
         ordered = order_for_the_day(chosen, hotel_lat, hotel_lon)
         kept, extra = trim_to_day_length(
-            ordered, max(1.0, windows[i]["available_hours"] - drive_back))
+            ordered, max(0.0, windows[i]["available_hours"] - drive_back))
         day_stops.append(kept)
         day_extra.append(extra + left_out)
 
@@ -984,8 +988,12 @@ def build_day_plan(attractions: list[dict], restaurants: list[dict], dates: list
         if kept or capacities[i] < 1.0:
             continue
         candidates = [(j, p) for j in range(num_days) for p in day_extra[j]
-                      if not _closed_on(p, dates[i])]
-        candidates += [(-1, p) for p in reserve if not _closed_on(p, dates[i])]
+                      if available_on(p, dates[i]) and
+                      day_metrics(order_for_the_day([p], hotel_lat, hotel_lon),
+                                  hotel_lat, hotel_lon)["hours"] <= windows[i]["available_hours"]]
+        candidates += [(-1, p) for p in reserve if available_on(p, dates[i]) and
+                       day_metrics(order_for_the_day([p], hotel_lat, hotel_lon),
+                                   hotel_lat, hotel_lon)["hours"] <= windows[i]["available_hours"]]
         if not candidates:
             continue
         j, borrowed = min(candidates, key=lambda jp: (-jp[1].get("score", 0) / 25.0
@@ -996,13 +1004,20 @@ def build_day_plan(attractions: list[dict], restaurants: list[dict], dates: list
         else:
             reserve = [p for p in reserve if p is not borrowed]
         chosen, _ = _pick_best_for_day([borrowed], capacities[i], max_stops)
-        day_stops[i] = _remeasure(chosen or [borrowed], hotel_lat, hotel_lon)
+        day_stops[i] = _remeasure(chosen, hotel_lat, hotel_lon)
 
     # Step 4.6: the same number of activities every day (the traveller's rule:
     # no "five stops today, one tomorrow").
     spare = [p for extra in day_extra for p in extra] + list(reserve)
     level_stop_counts(day_stops, dates, [w["available_hours"] for w in windows], spare,
                       (hotel_lat, hotel_lon), max_stops)
+    for i, stops in enumerate(day_stops):
+        kept, omitted = fit_day(stops, windows[i]["available_hours"],
+                                hotel_lat, hotel_lon, max_stops,
+                                start_hour=windows[i]["start_hour"],
+                                lunch=bool(restaurants) and lunch_fits_window(windows[i]))
+        day_stops[i] = kept
+        spare.extend(omitted)
     planned = {p["name"] for stops in day_stops for p in stops}
     day_extra = [[] for _ in range(num_days)]
     reserve = [p for p in spare if p["name"] not in planned]
@@ -1014,7 +1029,7 @@ def build_day_plan(attractions: list[dict], restaurants: list[dict], dates: list
         kept, extra = day_stops[i], day_extra[i]
         w = windows[i]
 
-        lunch = pick_lunch(restaurants, kept, used_lunch) if kept else None
+        lunch = pick_lunch(restaurants, kept, used_lunch) if kept and lunch_fits_window(w) else None
         if lunch:
             used_lunch.add(lunch["name"])
 
@@ -1036,6 +1051,8 @@ def build_day_plan(attractions: list[dict], restaurants: list[dict], dates: list
             "lunch": lunch,
             "total_km": total_km,
             "hours": hours,
+            "elapsed_hours": day_elapsed_hours(kept, hotel_lat, hotel_lon,
+                                                w["start_hour"], bool(lunch)),
             "is_rainy": date_string in rainy_dates,
             "rain_chance": rain_chances.get(date_string),
             "is_wettest": date_string == wettest,
@@ -1043,6 +1060,7 @@ def build_day_plan(attractions: list[dict], restaurants: list[dict], dates: list
             "extra_ideas": [e["name"] for e in extra],
             "start_hour": w["start_hour"],
             "available_hours": w["available_hours"],
+            "max_stops_per_day": max_stops,
             "travel_note": travel_note,
             "travel_day": w["available_hours"] < 1.0,
             "notes": notes,
@@ -1054,7 +1072,7 @@ def build_day_plan(attractions: list[dict], restaurants: list[dict], dates: list
     # shown on the day whose stops they sit closest to (and that they are open on).
     for place in reserve[:num_days * 2]:
         options = [j for j in range(num_days) if days[j]["stops"]
-                   and not _closed_on(place, dates[j])]
+                   and available_on(place, dates[j])]
         if not options:
             continue
         near = min(options, key=lambda j: min(
@@ -1129,8 +1147,61 @@ def refresh_day(day: dict, hotel_lat: float, hotel_lon: float,
                      f"the evening for the drive back.").strip()
     day["travel_note"] = base_note
     if restaurants is not None and stops:
-        day["lunch"] = pick_lunch(restaurants, stops, used_lunch or set())
+        day["lunch"] = (pick_lunch(restaurants, stops, used_lunch or set())
+                        if lunch_fits_window(day) else None)
+    day["elapsed_hours"] = day_elapsed_hours(
+        stops, hotel_lat, hotel_lon, day.get("start_hour", DAY_START_HOUR), bool(day.get("lunch")))
     return day
+
+
+def lunch_fits_window(day: dict) -> bool:
+    """A morning-only sightseeing window does not require waiting for lunch."""
+    return day.get("start_hour", DAY_START_HOUR) + day.get("available_hours", MAX_HOURS_PER_DAY) > 12.5
+
+
+def day_elapsed_hours(stops: list[dict], hotel_lat: float, hotel_lon: float,
+                      start_hour: float = DAY_START_HOUR, lunch: bool = False) -> float:
+    """Clock duration including lunch, waiting and the return, shared with UI."""
+    if not stops:
+        return 0.0
+    base = (hotel_lat, hotel_lon)
+    trip = trip_distance(stops, base) > DAY_TRIP_KM
+    factor, speed = road_params(base, stops, _base_elev(base)) if trip else (1, 20)
+
+    def travel(km):
+        if not trip:
+            return km / 20.0
+        return km * factor / speed if km > 3 else km * 1.3 / 15.0
+
+    clock, had_lunch = start_hour, not lunch
+    for i, stop in enumerate(_remeasure(stops, *base)):
+        clock += travel(stop["leg_km"]) + stop.get("visit_hours", 1.5)
+        if not had_lunch and (clock >= 12.5 or i == len(stops) - 1):
+            clock = max(clock, 12.5) + 1.0
+            had_lunch = True
+    clock += travel(haversine_km(stops[-1]["lat"], stops[-1]["lon"], *base))
+    return round(clock - start_hour, 2)
+
+
+def fit_day(stops: list[dict], available_hours: float, hotel_lat: float, hotel_lon: float,
+            max_stops: int = DEFAULT_MAX_STOPS, *, start_hour: float = DAY_START_HOUR,
+            lunch: bool = False) -> tuple[list[dict], list[dict]]:
+    """Enforce the complete route duration, including the return to the stay.
+
+    A single faraway stop can be impossible too; there is no first-stop
+    exception. Dated and headline visits have priority when pruning a day.
+    """
+    kept, omitted = list(stops), []
+    while kept:
+        ordered = order_for_the_day(kept, hotel_lat, hotel_lon)
+        if len(kept) <= max_stops and day_elapsed_hours(
+                ordered, hotel_lat, hotel_lon, start_hour, lunch) <= available_hours:
+            return ordered, omitted
+        weakest = min(kept, key=lambda p: (
+            bool(p.get("only_on")), bool(p.get("must_see")), p.get("score", 0)))
+        kept.remove(weakest)
+        omitted.append(weakest)
+    return [], omitted
 
 
 def pick_lunch(restaurants: list[dict], stops: list[dict],
